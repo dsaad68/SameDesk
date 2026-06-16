@@ -1,0 +1,66 @@
+name: CI
+
+# Build + test + lint gates on every push and PR. Kept separate from release.yml
+# (which only runs on main and packages the .app) so a red build blocks merges
+# without touching the release path.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select newest Xcode (needs Swift 6 for swift-async-algorithms)
+        run: |
+          set -euo pipefail
+          latest=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "Selecting $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          swift --version
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
+
+  lint:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install SwiftFormat + SwiftLint
+        run: brew install swiftformat swiftlint
+
+      - name: SwiftFormat (lint only)
+        run: swiftformat --lint .
+
+      - name: SwiftLint (strict)
+        run: swiftlint lint --strict
+
+  browser:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Tests/browser
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        run: npm install
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run browser smoke tests
+        run: npx playwright test

@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SameDesk}",
+            "name": "Debug SameDesk",
+            "target": "SameDesk",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug SameDesk"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SameDesk}",
+            "name": "Release SameDesk",
+            "target": "SameDesk",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release SameDesk"
+        }
+    ]
+}

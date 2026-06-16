@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>SameDesk</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0a0a0c; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #screen, #canvas { width: 100%; height: 100%; object-fit: contain; background: #000;
+    cursor: none; outline: none; }
+  .hiddenEl { display: none !important; }
+
+  .glass {
+    position: fixed; z-index: 10; color: #f5f5f7;
+    background: rgba(30, 30, 34, 0.45);
+    backdrop-filter: blur(24px) saturate(160%);
+    -webkit-backdrop-filter: blur(24px) saturate(160%);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    padding: 10px 14px; font-size: 12px; line-height: 1.5;
+    transition: opacity 0.25s ease;
+  }
+  .glass.hidden { opacity: 0; pointer-events: none; }
+
+  #hud { top: 14px; right: 14px; min-width: 190px; }
+  #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+  #hud .label { opacity: 0.6; }
+  #hud .val { font-variant-numeric: tabular-nums; font-weight: 600; }
+  #graph { display: block; margin-top: 8px; border-radius: 8px;
+    background: rgba(0,0,0,0.25); width: 220px; height: 56px; }
+  #hud button { margin-top: 8px; width: 100%; appearance: none; color: #f5f5f7;
+    border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.06);
+    border-radius: 8px; padding: 6px 10px; font-size: 11px; cursor: pointer; }
+  #hud button:hover { background: rgba(255,255,255,0.14); }
+
+  /* Small reopen pill shown in the top-right after the HUD is dismissed. */
+  #hudReopen { top: 14px; right: 14px; width: 40px; height: 40px; padding: 0;
+    appearance: none; color: #f5f5f7;
+    display: flex; align-items: center; justify-content: center; font-size: 18px;
+    cursor: pointer; }
+  #hudReopen:hover { background: rgba(255,255,255,0.14); }
+
+  #controls { position: fixed; z-index: 10; top: 14px; left: 14px;
+    display: flex; flex-direction: column; gap: 8px; }
+  #controls button {
+    appearance: none; border: 1px solid rgba(255,255,255,0.14);
+    background: rgba(255,255,255,0.06); color: #f5f5f7;
+    border-radius: 10px; padding: 8px 12px; font-size: 12px; cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  #controls button:hover { background: rgba(255,255,255,0.14); }
+  #controls button.active { background: rgba(10,132,255,0.7); border-color: rgba(10,132,255,0.9); }
+
+  #status { bottom: 14px; left: 50%; transform: translateX(-50%); text-align: center;
+    max-width: 80vw; }
+  #status.error { background: rgba(120, 20, 24, 0.5); border-color: rgba(255,80,80,0.4); }
+
+  .dismiss { position: absolute; top: 6px; right: 8px; cursor: pointer; opacity: 0.4;
+    font-size: 13px; }
+  .dismiss:hover { opacity: 0.9; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas" tabindex="0"></canvas>
+    <video id="screen" class="hiddenEl" autoplay muted playsinline tabindex="0"></video>
+  </div>
+
+  <div id="hud" class="glass">
+    <span class="dismiss" id="hudClose">×</span>
+    <div class="row"><span class="label">FPS</span><span class="val" id="fps">–</span></div>
+    <div class="row"><span class="label">Bitrate</span><span class="val" id="bitrate">–</span></div>
+    <div class="row"><span class="label">Latency</span><span class="val" id="latency">–</span></div>
+    <div class="row"><span class="label">Glass-glass</span><span class="val" id="e2e">–</span></div>
+    <div class="row"><span class="label">Quality</span><span class="val" id="quality">–</span></div>
+    <div class="row"><span class="label">Decoder</span><span class="val" id="decoder">–</span></div>
+    <canvas id="graph" width="220" height="56"></canvas>
+    <button id="hudExport">Export last 5 min (CSV)</button>
+  </div>
+
+  <button id="hudReopen" class="glass hiddenEl" title="Show stats" aria-label="Show stats"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 17V9"/><path d="M18 17V5"/><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M8 17v-3"/></svg></button>
+
+  <div id="controls">
+    <button id="pointerlock" title="Capture the mouse for a 1:1 relative desktop feel">Pointer Lock: Off</button>
+    <button id="autoquality" class="active" title="Automatically tune bitrate to keep latency low">Auto Quality: On</button>
+    <button id="passthrough" title="Send system shortcuts (Cmd+Tab, Cmd+Space) to the remote Mac">Shortcut Passthrough: Off</button>
+    <button id="hudToggle">Hide HUD</button>
+  </div>
+
+  <div id="status" class="glass">Connecting…</div>
+
+<script src="/client.js"></script>
+</body>
+</html>

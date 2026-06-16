@@ -1,0 +1,45 @@
+# SameDesk SwiftFormat config — deliberately conservative.
+#
+# Philosophy: apply the purely-cosmetic, safe cleanups (import sorting,
+# indentation, trailing whitespace, stray leading blank lines) but PRESERVE the
+# codebase's hand-tuned style — concise one-liner bodies, explicit `self` and
+# `return`, `&&` in conditions, argument labels, digit grouping, and the
+# hand-wrapped multi-line call sites. Reconciled with .swiftlint.yml so the two
+# tools never fight (no trailing commas; braces stay on the same line).
+
+--swiftversion 6.0
+
+# --- Preserve concise one-liner bodies (CLAUDE.md mandate) ----------------------
+--disable wrapFunctionBodies       # keep `func f() { body }`
+--disable wrapPropertyBodies       # keep `var x: T { body }`
+--disable wrapLoopBodies           # keep `for x in xs { body }`
+--disable wrapMultilineStatementBraces
+
+# --- Leave signatures, self, returns, and concurrency annotations alone ---------
+--disable redundantSelf            # explicit `self.` is deliberate here
+--disable redundantReturn          # keep explicit `return`
+--disable redundantType            # keep explicit `: T = T(...)`
+--disable redundantSendable        # leave concurrency annotations alone
+--disable redundantViewBuilder
+--disable unusedArguments          # keep labels like `_ notification: Notification`
+
+# --- Don't rewrite operators / patterns / hand-wrapped arguments ----------------
+--disable andOperator              # keep `a && b`, never `a, b`
+--disable hoistPatternLet
+--disable hoistTry
+--disable preferKeyPath            # keep `{ $0.foo }` closures
+--disable wrapArguments            # keep hand-aligned multi-line call sites
+--disable docComments              # don't rewrite `//` into `///`
+--disable consecutiveSpaces        # keep aligned trailing comments
+--disable blankLinesBetweenScopes  # don't inject blank lines between members
+--disable trailingCommas           # reconciled with SwiftLint
+
+# --- Don't reflow numbers or ranges --------------------------------------------
+--decimalgrouping ignore           # keep `48_000`
+--binarygrouping ignore
+--hexgrouping ignore
+--octalgrouping ignore
+--ranges nospace                   # keep `0..<n`
+
+# --- Excludes ------------------------------------------------------------------
+--exclude .build,Sources/SameDesk/Client/client.js,Sources/SameDesk/Client/client.html

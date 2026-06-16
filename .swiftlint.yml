@@ -1,0 +1,35 @@
+# SameDesk SwiftLint config. Run strict (warnings treated as errors), both in CI
+# and locally. Reconciled with .swiftformat so the two tools never disagree
+# (no trailing commas; braces stay on the same line).
+
+included:
+  - Sources
+  - Tests
+
+excluded:
+  - .build
+
+# The codebase deliberately uses short, math-y names — coordinates (x, y, dx, dy),
+# timestamps (t, s), and tight-loop indices (i, f, ch, c, d) — plus idiomatic
+# abbreviations (vm, pb, fn, on, js). Allow them.
+identifier_name:
+  min_length:
+    warning: 1
+    error: 1
+
+# A couple of user-facing error messages are long interpolated strings that read
+# best on one line; let those through, otherwise hold a firm 150.
+line_length:
+  warning: 150
+  error: 150
+  ignores_urls: true
+  ignores_interpolated_strings: true
+
+# These fire on a few large-but-cohesive units (the app coordinator, the
+# from-scratch fMP4 muxer, the settings view). Splitting them to satisfy a line
+# count would hurt readability more than it helps.
+disabled_rules:
+  - cyclomatic_complexity
+  - function_body_length
+  - type_body_length
+  - file_length

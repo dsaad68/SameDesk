@@ -1,0 +1,65 @@
+name: Update SameDesk cask
+
+# Keeps Casks/samedesk.rb in sync with the latest SameDesk release.
+#  - repository_dispatch: fired instantly by SameDesk's release workflow
+#    (carries version + sha256, no download needed).
+#  - workflow_dispatch:   manual run, optionally pinning a version.
+#  - schedule:            daily safety net in case a dispatch is ever missed.
+on:
+  repository_dispatch:
+    types: [samedesk-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SameDesk version (blank = latest release)"
+        required: false
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version + sha256
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          if [ -z "$ver" ]; then
+            ver="$(gh release view --repo dsaad68/SameDesk --json tagName -q .tagName | sed 's/^v//')"
+          fi
+          sha="${{ github.event.client_payload.sha256 }}"
+          if [ -z "$sha" ]; then
+            url="https://github.com/dsaad68/SameDesk/releases/download/v${ver}/SameDesk-macos-arm64.zip"
+            sha="$(curl -fsSL "$url" | shasum -a 256 | awk '{print $1}')"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha"   >> "$GITHUB_OUTPUT"
+          echo "Resolved SameDesk $ver ($sha)"
+
+      - name: Rewrite cask
+        run: |
+          set -euo pipefail
+          f=Casks/samedesk.rb
+          sed -i -E "s/^  version \".*\"/  version \"${{ steps.v.outputs.version }}\"/" "$f"
+          sed -i -E "s/^  sha256 \".*\"/  sha256 \"${{ steps.v.outputs.sha256 }}\"/" "$f"
+          git --no-pager diff -- "$f"
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "Cask already up to date."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "samedesk ${{ steps.v.outputs.version }}"
+          git push

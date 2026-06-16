@@ -1,0 +1,127 @@
+name: Release
+
+# Publish a GitHub Release whenever main is updated. The release version, tag,
+# and notes all come from the top entry of CHANGELOG.md. A release is created
+# only when that version has no existing tag yet — so ordinary commits to main
+# don't produce duplicate releases; bumping the changelog version is what cuts a
+# new release.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Extract latest changelog entry
+        id: changelog
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          if [ -z "$version" ]; then
+            echo "::error::No '## [x.y.z]' version header found in CHANGELOG.md"
+            exit 1
+          fi
+          # Body = everything between this version header and the next one.
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { inblock=1; next }
+            inblock && /^## \[/      { exit }
+            inblock                  { print }
+          ' CHANGELOG.md > notes.md
+          # Trim leading and trailing blank lines (keep blanks between sections).
+          sed -i '' -e '/./,$!d' notes.md
+          awk 'NF{last=NR} {line[NR]=$0} END{for(i=1;i<=last;i++) print line[i]}' \
+            notes.md > notes.trimmed && mv notes.trimmed notes.md
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release version: $version"
+          echo "----- notes.md -----"
+          cat notes.md
+
+      - name: Check whether this release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.changelog.outputs.tag }}" >/dev/null 2>&1; then
+            echo "is_new=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.changelog.outputs.tag }} already exists — skipping."
+          else
+            echo "is_new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Select newest Xcode (needs Swift 6 for swift-async-algorithms)
+        if: steps.existing.outputs.is_new == 'true'
+        run: |
+          set -euo pipefail
+          latest=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "Selecting $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          swift --version
+
+      - name: Build release binary
+        if: steps.existing.outputs.is_new == 'true'
+        run: swift build -c release
+
+      - name: Assemble SameDesk.app
+        id: package
+        if: steps.existing.outputs.is_new == 'true'
+        run: |
+          set -euo pipefail
+          # Build a proper .app (Info.plist + LSUIElement + ad-hoc signature).
+          # make-app.sh runs the bundled-asset self-test, so a broken resource
+          # layout fails the release here rather than on a user's machine.
+          ./scripts/make-app.sh "${{ steps.changelog.outputs.version }}"
+          # `ditto` preserves the .app layout for distribution (zip mangles it).
+          ditto -c -k --keepParent dist/SameDesk.app "$GITHUB_WORKSPACE/SameDesk-macos-arm64.zip"
+          sha="$(shasum -a 256 SameDesk-macos-arm64.zip | awk '{print $1}')"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "Artifact sha256: $sha"
+
+      - name: Create GitHub Release
+        if: steps.existing.outputs.is_new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.changelog.outputs.tag }}" \
+            --target "${{ github.sha }}" \
+            --title "SameDesk ${{ steps.changelog.outputs.tag }}" \
+            --notes-file notes.md \
+            SameDesk-macos-arm64.zip
+
+      # Optional: tell the Homebrew tap to bump the cask. No-op until you create
+      # the dsaad68/homebrew-tap repo AND add a HOMEBREW_TAP_TOKEN secret (a PAT
+      # with `contents:write` on that repo). Without the secret this is skipped,
+      # so releases keep working before the tap is published.
+      - name: Bump Homebrew cask
+        if: steps.existing.outputs.is_new == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping cask bump."
+            exit 0
+          fi
+          GH_TOKEN="$TAP_TOKEN" gh api repos/dsaad68/homebrew-tap/dispatches \
+            -f event_type=samedesk-release \
+            -F client_payload[version]="${{ steps.changelog.outputs.version }}" \
+            -F client_payload[sha256]="${{ steps.package.outputs.sha256 }}"
