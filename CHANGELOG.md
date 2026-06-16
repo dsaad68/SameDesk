@@ -9,71 +9,43 @@ The latest entry below drives the GitHub Release published automatically when
 `main` is updated (see `.github/workflows/release.yml`). To cut a release, add a
 new `## [x.y.z] - YYYY-MM-DD` section at the top and merge to `main`.
 
-## [1.1.0] - 2026-06-15
+## [0.1.0] - 2026-06-16
 
-### Added
-- **Homebrew cask** install (`brew install --cask dsaad68/tap/samedesk`) backed
-  by a proper, ad-hoc-signed **`SameDesk.app`** bundle. Releases now ship the
-  `.app` (not a bare binary), so granted Screen Recording / Accessibility
-  permissions persist across upgrades.
-- `scripts/make-app.sh` — assembles and signs the `.app` (Info.plist,
-  `LSUIElement`, stable bundle id `io.github.dsaad68.SameDesk`) with a built-in
-  bundled-asset self-test (`SAMEDESK_SELFTEST`).
-- MIT `LICENSE`.
-
-### Changed
-- Browser assets resolve from standard bundle locations
-  (`ClientAssets.candidateURLs`) instead of `Bundle.module`, so the client page
-  loads whether SameDesk runs as a `.app` or a bare binary.
-- The release workflow builds and publishes the `.app` zip and can auto-bump the
-  Homebrew cask in `dsaad68/homebrew-tap`.
-
-## [1.0.0] - 2026-06-15
-
-First tagged release.
+Initial public release.
 
 ### Added
 - **Local-network remote desktop**: stream a Mac's screen to any modern browser
-  on the same LAN and control it back (keyboard, mouse, scroll, clipboard).
-- **Capture → encode → mux pipeline**: ScreenCaptureKit capture, H.264 encoding
-  via VideoToolbox (High / auto-level), and an on-the-fly hand-rolled fragmented
-  MP4 muxer.
-- **Two browser video backends** sharing one interface: low-latency **WebCodecs**
-  (decode to `<canvas>`) by default, with **MSE** (`SourceBuffer`) as fallback.
-  The init segment is self-describing, so the client adapts to the stream codec.
-- **HEVC / H.265 option** (~2× compression at the same bitrate) with automatic
-  fallback to H.264 when the Mac can't encode HEVC.
-- **System audio streaming** (off by default): interleaved Float32 PCM over the
-  socket, played via the Web Audio API.
-- **Separate `/input` WebSocket** so input/clipboard/ping never queue behind
-  video frames, and the measured RTT reflects true input latency.
-- **Delta encoding**: skip frames with no dirty rects so an idle screen drops to
-  near-zero bandwidth.
-- **RTT-driven auto quality**: the client tunes target bitrate to keep latency low.
-- **Headless / virtual display** support via the private `CGVirtualDisplay` API,
-  with graceful fallback when unavailable.
+  on the same LAN and control it back (keyboard, mouse, scroll, pinch-zoom, and
+  two-way clipboard) over an authenticated HTTPS + WebSocket endpoint.
+- **Capture → encode → mux pipeline**: ScreenCaptureKit capture, H.264 (or
+  optional HEVC — ~2× compression, automatic H.264 fallback) via VideoToolbox,
+  and an on-the-fly hand-rolled fragmented-MP4 muxer.
+- **Two browser video backends** behind one interface: low-latency WebCodecs
+  (decode to `<canvas>`) by default, MSE (`SourceBuffer`) fallback. The
+  self-describing init segment lets the client adapt to the stream codec.
+- **System audio streaming** (optional), played via the Web Audio API, over a
+  separate `/input` socket so input/clipboard/ping never queue behind video.
+- **Delta encoding** drops an idle screen to near-zero bandwidth, and
+  **RTT-driven auto quality** tunes the target bitrate to keep latency low.
+- **Native first-run onboarding**: live permission + mkcert status, the tokenized
+  URL with QR code, Copy URL / AirDrop, a copyable mkcert command, and per-device
+  trust steps.
+- **Pairing-cookie auth**: a tokenized URL sets an HttpOnly session cookie and
+  redirects to a clean URL (keeping the token out of browser history); WebSockets
+  stay token/cookie-gated.
 - **In-page HUD**: FPS, bitrate, RTT, glass-to-glass latency (incl. 1s peak), a
-  bitrate graph, and an "Export last 5 min (CSV)" button for offline analysis.
-- **Security**: ≥32-byte Keychain-stored access token (constant-time compare),
-  HTTPS + WSS only via a locally-trusted mkcert certificate, binding to the LAN
-  IPv4 interface only (never `0.0.0.0`/IPv6), a startup pre-flight that refuses to
-  start if not LAN-private, and no UPnP/NAT-PMP port mapping by design.
-- **Menu bar**: status line, Copy URL, AirDrop URL…, Settings… (⌘,), Start/Stop
-  Server, and Quit — each with an SF Symbol icon.
-- **Settings window**: vertical tabs (Connection / Video / Audio / Display /
-  Security) covering port, bitrate, delta encoding, HEVC, audio, headless display,
-  and access-token reveal/copy/regenerate.
-
-### Changed
-- The browser client is now served as **static `client.html` + `client.js`**
-  assets from the resource bundle (authored as real files, no Swift-string
-  escaping). The video codec is delivered to the client at runtime as the first
-  message on the media socket, keeping the page fully static.
-- **Settings window redesigned** to a flat, opaque dark theme — removed the
-  vibrancy/"glass" surfaces while keeping the mint/green accent palette.
-
-### Fixed
-- Client script no longer fails to parse (page stuck on "Connecting…"): a `\n`
-  inside the embedded JS was being turned into a real newline by Swift's string
-  literal, producing an unterminated string in the served JavaScript.
-- Periodic-keyframe hiccup in the latency readout.
+  bitrate graph, and an "Export last 5 min (CSV)" button.
+- **Settings window** (Connection / Video / Audio / Display / Security): port,
+  bitrate, delta encoding, HEVC, audio, headless display, capture-resolution
+  presets (Auto / 1080p / 1440p / Native-ish), access-token reveal/regenerate,
+  and a Copy Diagnostics action.
+- **Headless / virtual display** support via the private `CGVirtualDisplay` API.
+- **Security hardening**: ≥32-byte Keychain-stored token (constant-time compare),
+  HTTPS + WSS only via a locally-trusted mkcert cert, binding to the LAN IPv4
+  interface only (never `0.0.0.0` / IPv6), a LAN-private startup pre-flight, and
+  no UPnP/NAT-PMP port mapping by design.
+- **Packaging & tooling**: a signed `SameDesk.app` (stable bundle id so
+  permission grants persist across upgrades), a `justfile` (build / run /
+  install-on-PATH / test / lint), unit tests plus Playwright browser smoke
+  tests, and a GitHub Actions CI + release pipeline.
+- App icon authored in Icon Composer (Liquid Glass), and an MIT `LICENSE`.
