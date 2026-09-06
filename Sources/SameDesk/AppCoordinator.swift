@@ -34,6 +34,7 @@ final class AppCoordinator {
     // Input / clipboard
     private let inputController = InputController()
     private let clipboard = ClipboardSync()
+    private let cursorTracker = CursorTracker()
 
     // Virtual display
     private let virtualDisplay = VirtualDisplayManager()
@@ -146,6 +147,7 @@ final class AppCoordinator {
         let capturer = ScreenCapturer(encoder: encoder)
         capturer.deltaEncodingEnabled = Settings.shared.deltaEncoding
         capturer.audioEnabled = Settings.shared.audioEnabled
+        capturer.showsCursor = !Settings.shared.localCursor
         if Settings.shared.downscaleEnabled {
             capturer.downscale = Settings.shared.downscaleSize
         }
@@ -168,14 +170,25 @@ final class AppCoordinator {
             capturer?.emitKeyframeFromCache()
         }
 
-        // 7. Input + clipboard wiring.
+        // 7. Cursor: rendered by the client, so it rides the control socket
+        //    rather than the video stream.
+        if Settings.shared.localCursor {
+            cursorTracker.targetDisplayID = activeDisplayID
+            cursorTracker.onUpdate = { [weak self] json in
+                guard let self else { return }
+                Task { await self.broadcaster.broadcastText(json) }
+            }
+            cursorTracker.start()
+        }
+
+        // 8. Input + clipboard wiring.
         clipboard.onLocalChange = { [weak self] text in
             guard let self else { return }
             Task { await self.broadcaster.broadcastText(OutboundMessage.clipboard(text).jsonString()) }
         }
         clipboard.start()
 
-        // 8. Server.
+        // 9. Server.
         let codecHolder = self.codecHolder
         let server = SameDeskServer(broadcaster: broadcaster, tokenStore: tokenStore,
                                     codecProvider: { codecHolder.withLock { $0 } })
@@ -206,6 +219,7 @@ final class AppCoordinator {
 
     func stopAsync() async {
         await server?.stop(); server = nil
+        cursorTracker.stop()
         clipboard.stop()
         await capturer?.stop(); capturer = nil
         frameConsumer?.cancel(); frameConsumer = nil
@@ -271,6 +285,13 @@ final class AppCoordinator {
     func setHeadless(_ on: Bool) {
         Settings.shared.headlessVirtualDisplay = on
         // Requires a capture restart to (de)allocate the virtual display.
+        if isRunning { restart() } else { notify() }
+    }
+
+    /// Toggle browser-side cursor rendering. `showsCursor` is fixed when the
+    /// capture stream is created, so this needs a restart.
+    func setLocalCursor(_ on: Bool) {
+        Settings.shared.localCursor = on
         if isRunning { restart() } else { notify() }
     }
 
@@ -399,6 +420,7 @@ final class AppCoordinator {
         Delta:     \(Settings.shared.deltaEncoding ? "on" : "off")
         Display:   \(dw)×\(dh)  (downscale: \(downscale))
         Audio:     \(Settings.shared.audioEnabled ? "on" : "off")
+        Cursor:    \(Settings.shared.localCursor ? "client-rendered" : "in stream")
 
         Screen Recording: \(mark(Permissions.hasScreenRecording))
         Accessibility:    \(mark(Permissions.hasAccessibility))

@@ -213,6 +213,10 @@ struct SettingsView: View {
                 ToggleRow(title: "HEVC / H.265",
                           subtitle: "≈2× compression (sharper at the same bitrate). Needs Safari 17+ or hardware HEVC; falls back to H.264.",
                           isOn: $vm.useHEVC)
+                Divider().overlay(Theme.hairline)
+                ToggleRow(title: "Client-Rendered Cursor",
+                          subtitle: "Draw the pointer in the browser instead of in the video — no round trip to see your own mouse move.",
+                          isOn: $vm.localCursor)
             }
             SettingsSection("Bitrate") {
                 HStack {

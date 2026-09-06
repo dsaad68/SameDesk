@@ -14,6 +14,12 @@
     cursor: none; outline: none; }
   .hiddenEl { display: none !important; }
 
+  /* Client-rendered pointer. The remote screen is captured without a cursor, so
+     this is the only one on screen — drawn at the LOCAL mouse position, which is
+     why it has no latency at all. */
+  #cursor { position: fixed; z-index: 5; pointer-events: none; will-change: transform;
+    image-rendering: -webkit-optimize-contrast; }
+
   .glass {
     position: fixed; z-index: 10; color: #f5f5f7;
     background: rgba(30, 30, 34, 0.45);
@@ -70,6 +76,7 @@
     <canvas id="canvas" tabindex="0"></canvas>
     <video id="screen" class="hiddenEl" autoplay muted playsinline tabindex="0"></video>
   </div>
+  <img id="cursor" class="hiddenEl" alt="">
 
   <div id="hud" class="glass">
     <span class="dismiss" id="hudClose">×</span>

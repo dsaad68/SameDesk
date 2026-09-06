@@ -462,6 +462,7 @@
       targetMbps = msg.mbps;
       updateQualityHUD();
     }
+    else if (msg.type === "cursor") Cursor.onMessage(msg);
     else if (msg.type === "clipboard" && msg.text != null) navigator.clipboard?.writeText(msg.text).catch(() => {});
     else if (msg.type === "reload") {
       // Server is restarting (settings/port change). Reload to recover cleanly —
@@ -503,10 +504,53 @@
 
   function locked() { return document.pointerLockElement === displayEl; }
 
+  // ---- Client-rendered cursor --------------------------------------------
+  // The stream is captured without a cursor; the server sends position and shape
+  // on the input socket instead. While the pointer is over the stage and free,
+  // we draw at the LOCAL mouse position — the pointer then moves at the speed of
+  // the mouse rather than the speed of the network, which is most of what makes
+  // a remote desktop feel remote. Server position takes over under pointer lock
+  // and whenever the mouse is elsewhere, so app-driven cursor moves still show.
+  const Cursor = (() => {
+    const el = document.getElementById("cursor");
+    let geom = null;          // hotspot + size, as fractions of the remote display
+    let serverPos = null;     // fractions of the remote display
+    let localPos = null;      // client px
+    let haveShape = false;
+
+    function onMessage(msg) {
+      if (typeof msg.png === "string") {
+        el.src = "data:image/png;base64," + msg.png;
+        haveShape = true;
+        el.classList.remove("hiddenEl");
+      }
+      geom = { hx: msg.hx, hy: msg.hy, w: msg.w, h: msg.h };
+      serverPos = { x: msg.x, y: msg.y };
+      render();
+    }
+    function onLocalMove(ev) { localPos = { x: ev.clientX, y: ev.clientY }; render(); }
+    function onLeave() { localPos = null; render(); }
+    function render() {
+      if (!geom || !haveShape) return;
+      const d = displayedRect();
+      let px, py;
+      if (localPos && !locked()) { px = localPos.x; py = localPos.y; }
+      else if (serverPos) { px = d.left + serverPos.x * d.w; py = d.top + serverPos.y * d.h; }
+      else return;
+      el.style.width = (geom.w * d.w) + "px";
+      el.style.height = (geom.h * d.h) + "px";
+      el.style.transform =
+        `translate(${px - geom.hx * d.w}px, ${py - geom.hy * d.h}px)`;
+    }
+    return { onMessage, onLocalMove, onLeave, render };
+  })();
+  window.addEventListener("resize", () => Cursor.render());
+
   // ---- Mouse / scroll / pinch --------------------------------------------
   // Listeners live on the stable #stage container so they keep working whether
   // the visible element is the canvas (WebCodecs) or the video (MSE).
-  stage.addEventListener("mousemove", (e) => {
+  function onPointerMove(e) {
+    Cursor.onLocalMove(e);
     if (locked()) {
       const d = displayedRect();
       sendInput({ type: "mousemove", rel: true, dx: e.movementX / d.w, dy: e.movementY / d.h,
@@ -514,7 +558,16 @@
     } else {
       const p = norm(e); sendInput({ type: "mousemove", x: p.x, y: p.y, button: e.buttons ? 0 : undefined });
     }
-  });
+  }
+  // Chromium aligns pointermove/mousemove to the render frame, which adds half a
+  // frame of input latency on average. pointerrawupdate fires as the events
+  // arrive; where it is unavailable (Safari) mousemove is the fallback.
+  if ("onpointerrawupdate" in window) {
+    stage.addEventListener("pointerrawupdate", onPointerMove);
+  } else {
+    stage.addEventListener("mousemove", onPointerMove);
+  }
+  stage.addEventListener("mouseleave", () => Cursor.onLeave());
   stage.addEventListener("mousedown", (e) => {
     e.preventDefault(); displayEl.focus();
     if (locked()) sendInput({ type: "mousedown", rel: true, button: e.button });

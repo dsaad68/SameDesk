@@ -51,6 +51,30 @@ test("HUD reports the bitrate the server settled on", async ({ page }) => {
   await expect(page.locator("#quality")).toHaveText("6.5 Mbps");
 });
 
+test("draws the client-rendered cursor from a server update", async ({ page }) => {
+  await page.goto("/");
+
+  // Nothing to draw until the server sends a shape; the stream may still be
+  // compositing its own cursor.
+  const cursor = page.locator("#cursor");
+  await expect(cursor).toHaveClass(/hiddenEl/);
+
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  await page.evaluate((data) =>
+    window.__sdSockets[1].emit(JSON.stringify({
+      type: "cursor", x: 0.5, y: 0.5, hx: 0, hy: 0, w: 0.02, h: 0.02, png: data,
+    })), png);
+
+  await expect(cursor).not.toHaveClass(/hiddenEl/);
+  // Sized and positioned relative to the displayed video area.
+  await expect
+    .poll(() => cursor.evaluate((el) => el.style.width))
+    .not.toBe("");
+  await expect
+    .poll(() => cursor.evaluate((el) => el.style.transform))
+    .toContain("translate");
+});
+
 test("shortcut-passthrough (keyboard lock) engages", async ({ page }) => {
   await page.goto("/");
 

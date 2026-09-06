@@ -19,6 +19,7 @@ final class Settings {
         static let downscaleHeight = "samedesk.downscaleHeight"
         static let useHEVC = "samedesk.useHEVC"
         static let audioEnabled = "samedesk.audioEnabled"
+        static let localCursor = "samedesk.localCursor"
         static let onboarded = "samedesk.onboarded"
     }
 
@@ -33,6 +34,7 @@ final class Settings {
             Key.downscaleHeight: 1080,
             Key.useHEVC: false,
             Key.audioEnabled: false,
+            Key.localCursor: true,
             Key.onboarded: false
         ])
     }
@@ -57,6 +59,15 @@ final class Settings {
     var useHEVC: Bool {
         get { defaults.bool(forKey: Key.useHEVC) }
         set { defaults.set(newValue, forKey: Key.useHEVC) }
+    }
+
+    /// Draw the cursor in the browser instead of compositing it into the video.
+    /// Removes a full round trip from pointer feedback and stops a mouse move
+    /// from dirtying an otherwise idle frame. Default on; turn it off to go back
+    /// to a cursor baked into the stream.
+    var localCursor: Bool {
+        get { defaults.bool(forKey: Key.localCursor) }
+        set { defaults.set(newValue, forKey: Key.localCursor) }
     }
 
     var port: Int {

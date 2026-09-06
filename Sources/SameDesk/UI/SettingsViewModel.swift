@@ -48,6 +48,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var bitrateMbps: Double { didSet { coordinator.setBitrate(Int(bitrateMbps * 1_000_000)) } }
     @Published var deltaEncoding: Bool { didSet { coordinator.setDeltaEncoding(deltaEncoding) } }
     @Published var useHEVC: Bool { didSet { coordinator.setHEVC(useHEVC) } }
+    @Published var localCursor: Bool { didSet { coordinator.setLocalCursor(localCursor) } }
     @Published var audioEnabled: Bool { didSet { coordinator.setAudio(audioEnabled) } }
     @Published var headless: Bool { didSet { coordinator.setHeadless(headless) } }
     @Published var downscalePreset: DownscalePreset { didSet { coordinator.setDownscale(downscalePreset.size) } }
@@ -65,6 +66,7 @@ final class SettingsViewModel: ObservableObject {
         bitrateMbps = Double(Settings.shared.bitrateBps) / 1_000_000
         deltaEncoding = Settings.shared.deltaEncoding
         useHEVC = Settings.shared.useHEVC
+        localCursor = Settings.shared.localCursor
         audioEnabled = Settings.shared.audioEnabled
         headless = Settings.shared.headlessVirtualDisplay
         downscalePreset = DownscalePreset.current(enabled: Settings.shared.downscaleEnabled,

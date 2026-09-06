@@ -22,6 +22,11 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Capture system audio alongside video.
     var audioEnabled: Bool = false
 
+    /// Composite the cursor into the captured frames. Off when the browser draws
+    /// the cursor itself (see `CursorTracker`), which is both lower latency and
+    /// cheaper — a bare mouse move stops dirtying the frame at all.
+    var showsCursor: Bool = true
+
     /// Delivered for each audio buffer: a ready-to-send payload of
     /// `[channels:1][reserved:2][sampleRate:4 BE][Float32 LE interleaved PCM…]`.
     /// (The broadcaster prepends a 1-byte type tag.)
@@ -95,7 +100,7 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         // frames the encoder holds in flight plus the one we cache for
         // keyframe-on-connect, or ScreenCaptureKit starves waiting for surfaces.
         config.queueDepth = 5
-        config.showsCursor = true
+        config.showsCursor = showsCursor
 
         if let downscale {
             config.width = downscale.width
