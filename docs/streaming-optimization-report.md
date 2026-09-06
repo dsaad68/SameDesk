@@ -3,6 +3,22 @@
 **Date:** 2026-09-05
 **Scope:** the capture → encode → mux → broadcast → browser pipeline, the input path, and audio. Based on a full read of the source on `main` plus a survey of how Sunshine/Moonlight (and the Lumen fork), Selkies, Parsec, RDP, Apple's own High Performance screen sharing, WebRTC (GCC), and Apple's VideoToolbox low‑latency mode approach the same problems. Sources are listed at the end.
 
+> **Status (numbering follows the table in §1).** Items 1–8 are implemented, and
+> the §10 instrumentation is in place, so the claims below can now be measured
+> rather than argued about. Two items are partial:
+>
+> - **9 (audio)** — audio moved to its own `/audio` connection and to Int16
+>   (half the bandwidth). Opus and the AudioWorklet ring buffer are not done:
+>   both need codec negotiation with the client and an untested CoreAudio encoder
+>   path, and on a LAN the transport split was the part that actually mattered.
+> - **10 (worker)** — `pointerrawupdate` is in. The worker/OffscreenCanvas
+>   migration is deliberately not; see §8.4.
+>
+> Also added beyond the list: capture is now sized to the client's viewport
+> (§3.4), and a stale-init-segment bug found on the way is fixed — clients kept
+> decoding against the first decoder config they were given even when the
+> encoder's parameter sets changed.
+
 ---
 
 ## 1. Bottom line

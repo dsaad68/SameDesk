@@ -486,12 +486,14 @@ final class AppCoordinator {
         frameConsumer = Task.detached {
             for await frame in stream {
                 if frame.isKeyframe, let fmt = frame.formatDescription {
+                    let hadConfig = muxer.isReady
                     if muxer.updateParameterSets(from: fmt) {
                         codecHolder.withLock { $0 = muxer.codecString }
-                        // Resolution or codec changed: every connected client is
-                        // holding an init segment that no longer describes the
-                        // stream, and nothing was resending it to them.
-                        await broadcaster.parameterSetsChanged()
+                        // Resolution or codec changed mid-stream: every connected
+                        // client is holding an init segment that no longer
+                        // describes the stream, and nothing was resending it.
+                        // (Not on the first keyframe — nobody has one yet.)
+                        if hadConfig { await broadcaster.parameterSetsChanged() }
                     }
                 }
                 guard muxer.isReady else { continue }

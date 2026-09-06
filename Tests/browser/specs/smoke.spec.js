@@ -75,6 +75,20 @@ test("draws the client-rendered cursor from a server update", async ({ page }) =
     .toContain("translate");
 });
 
+test("falls back to the native pointer when the server has no cursor shape", async ({ page }) => {
+  await page.goto("/");
+
+  await page.evaluate(() =>
+    window.__sdSockets[1].emit(JSON.stringify({
+      type: "cursor", x: 0.25, y: 0.25, fallback: true,
+    })));
+
+  // The stream carries no cursor in this mode, so showing none at all would be
+  // worse than showing a generic arrow.
+  await expect(page.locator("body")).toHaveClass(/nativeCursor/);
+  await expect(page.locator("#cursor")).toHaveClass(/hiddenEl/);
+});
+
 test("shortcut-passthrough (keyboard lock) engages", async ({ page }) => {
   await page.goto("/");
 

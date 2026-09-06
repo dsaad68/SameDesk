@@ -26,9 +26,14 @@ internet-exposure (LAN IPv4 only, never any UPnP/NAT-PMP mapping).
   pinch-to-zoom, and two-way **clipboard** sync.
 - **Low-latency video**: WebCodecs decode to `<canvas>` by default, MSE fallback;
   optional **HEVC/H.265** for ~2× compression, with automatic H.264 fallback.
-- **System audio** streaming (optional), played via the Web Audio API.
-- **Adaptive bitrate** (RTT-driven) and **delta encoding** that drops an idle
-  screen to near-zero bandwidth.
+  VideoToolbox low-latency rate control, and the SPS is rewritten so browser
+  decoders emit one frame per chunk instead of buffering a reorder window.
+- **Client-rendered cursor**: the pointer is drawn in the browser at the local
+  mouse position, so seeing your own cursor move costs no round trip.
+- **System audio** streaming (optional) on its own connection, played via the Web
+  Audio API.
+- **Adaptive bitrate** driven by measured send-queue delay, and **delta encoding**
+  that drops an idle screen to near-zero bandwidth.
 - **In-page HUD** with FPS, bitrate, RTT, glass-to-glass latency, and a CSV export
   of the last five minutes.
 - **Headless / virtual display** when no monitor is attached.
@@ -142,10 +147,18 @@ bundle). To cut a release, add a new changelog entry at the top and merge to
 ## Architecture
 
 ```
-ScreenCaptureKit ──► H264Encoder (VideoToolbox) ──► FMP4Muxer ──► Broadcaster ──► WebSocket ──► Browser (MSE)
-   (dirty-rect           (real-time, High/auto,        (ftyp/moov         (per-client
-    gating)               no B-frames)                  + moof/mdat)        drop-oldest queues)
+ScreenCaptureKit ──► H264Encoder (VideoToolbox) ──► FMP4Muxer ──► Broadcaster ──► WebSocket ──► Browser
+   (dirty-rect           (low-latency RC,             (ftyp/moov      (shallow per-client    (WebCodecs
+    gating, 420v,         no B-frames, QP floor)       + moof/mdat,    queues; an overflow    or MSE)
+    static refinement)                                 SPS rewritten)  resyncs that client)
+                                                                             │
+                          CongestionController ◄── send-queue delay ─────────┘
+                                   │
+                                   └──► encoder bitrate + QP floor
 ```
+
+Video rides `/ws`, audio `/audio`, and input/clipboard/cursor/control `/input`,
+so none of them can queue behind the others.
 
 | Area | File |
 |------|------|
@@ -155,11 +168,14 @@ ScreenCaptureKit ──► H264Encoder (VideoToolbox) ──► FMP4Muxer ──
 | Security: mkcert TLS | `Security/CertificateManager.swift` |
 | Security: LAN-only pre-flight, `getifaddrs` | `Security/NetworkLockdown.swift` |
 | Resolvable `.local` hostname | `Security/Hostname.swift` |
-| Capture (dirty-rect / delta gating) | `Capture/ScreenCapturer.swift` |
+| Capture (dirty-rect / delta gating, sizing) | `Capture/ScreenCapturer.swift` |
+| Cursor tracking (client-rendered pointer) | `Capture/CursorTracker.swift` |
 | H.264 encode | `Encode/H264Encoder.swift` |
+| SPS VUI rewrite (decoder reorder window) | `Encode/H264ParameterSets.swift` |
 | Hand-rolled fMP4 muxer | `Encode/FMP4Muxer.swift` |
 | HTTPS + WSS server (Hummingbird) | `Server/SameDeskServer.swift` |
 | Per-client broadcast | `Server/Broadcaster.swift` |
+| Bitrate policy (send-queue delay) | `Server/CongestionController.swift` |
 | Wire protocol (JSON) | `Server/Protocol.swift` |
 | Input injection (`CGEvent`) | `Input/InputController.swift`, `Input/KeyMap.swift` |
 | Clipboard sync | `Clipboard/ClipboardSync.swift` |
@@ -231,7 +247,10 @@ broken; the implemented behavior is:
   true input latency.
 - **Transport note:** video rides the WebSocket (TCP). True UDP-style transport
   (WebTransport/WebRTC) would cut latency further but needs an HTTP/3 stack that
-  has no production-ready Swift implementation yet — tracked as future work.
+  has no production-ready Swift implementation yet — tracked as future work. The
+  queueing that made TCP hurt (deep per-client buffers, an auto-tuned kernel send
+  buffer, no congestion signal) is addressed in
+  [`docs/streaming-optimization-report.md`](docs/streaming-optimization-report.md).
 - **MSE needs fMP4**, not raw NAL units — hence the hand-rolled `FMP4Muxer`
   (`ftyp`+`moov` init segment from the SPS/PPS, then `moof`+`mdat` fragments).
   The video path is kept modular so MSE↔WebCodecs is a localized swap.

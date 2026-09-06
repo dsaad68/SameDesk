@@ -552,6 +552,14 @@
     let haveShape = false;
 
     function onMessage(msg) {
+      if (msg.fallback) {
+        // The server is not compositing a cursor and could not read the system
+        // one either. Show the browser's own pointer instead of nothing.
+        el.classList.add("hiddenEl");
+        document.body.classList.add("nativeCursor");
+        return;
+      }
+      document.body.classList.remove("nativeCursor");
       if (typeof msg.png === "string") {
         el.src = "data:image/png;base64," + msg.png;
         haveShape = true;
@@ -582,7 +590,14 @@
   // ---- Mouse / scroll / pinch --------------------------------------------
   // Listeners live on the stable #stage container so they keep working whether
   // the visible element is the canvas (WebCodecs) or the video (MSE).
+  // Chromium aligns pointermove/mousemove to the render frame, which costs half
+  // a frame of input latency on average; pointerrawupdate fires as events
+  // arrive. Both are registered and the raw one wins when it is live, so an
+  // engine that never fires it (Safari) still moves the mouse.
+  let lastRawUpdate = 0;
   function onPointerMove(e) {
+    if (e.type === "pointerrawupdate") lastRawUpdate = performance.now();
+    else if (performance.now() - lastRawUpdate < 500) return;
     Cursor.onLocalMove(e);
     if (locked()) {
       const d = displayedRect();
@@ -592,14 +607,8 @@
       const p = norm(e); sendInput({ type: "mousemove", x: p.x, y: p.y, button: e.buttons ? 0 : undefined });
     }
   }
-  // Chromium aligns pointermove/mousemove to the render frame, which adds half a
-  // frame of input latency on average. pointerrawupdate fires as the events
-  // arrive; where it is unavailable (Safari) mousemove is the fallback.
-  if ("onpointerrawupdate" in window) {
-    stage.addEventListener("pointerrawupdate", onPointerMove);
-  } else {
-    stage.addEventListener("mousemove", onPointerMove);
-  }
+  stage.addEventListener("pointerrawupdate", onPointerMove);
+  stage.addEventListener("mousemove", onPointerMove);
   stage.addEventListener("mouseleave", () => Cursor.onLeave());
   stage.addEventListener("mousedown", (e) => {
     e.preventDefault(); displayEl.focus();

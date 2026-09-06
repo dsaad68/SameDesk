@@ -9,6 +9,51 @@ The latest entry below drives the GitHub Release published automatically when
 `main` is updated (see `.github/workflows/release.yml`). To cut a release, add a
 new `## [x.y.z] - YYYY-MM-DD` section at the top and merge to `main`.
 
+## [Unreleased]
+
+### Fixed
+- **Dropped frames no longer corrupt the stream.** Both drop-oldest queues
+  (encoder→consumer and per-client) discarded encoded frames silently; with no
+  periodic IDR, a discarded P-frame broke the decoder's reference chain until
+  something happened to throw. Overflow now resynchronises that client on a fresh
+  init segment and keyframe.
+- **A Wi-Fi blip is a brief freeze, not a multi-second fast-forward.** The
+  per-client queue held ~1.5 s of video (90 frames) with an auto-tuned kernel send
+  buffer holding megabytes more below it. The queue is now 6 frames, `SO_SNDBUF`
+  is capped, and a slow socket write sheds the stale backlog instead of playing it
+  out late. The browser does the same on its side, skipping to the next keyframe
+  rather than decoding a backlog.
+- **Browser decoders no longer buffer decoded frames.** VideoToolbox omits the
+  VUI bitstream restriction, so decoders fall back to the reorder window implied
+  by the level — up to 16 frames of latency invisible in any bitrate or RTT graph.
+  The muxer now rewrites the SPS to signal `max_num_reorder_frames = 0`.
+- **Blurry text after scrolling.** Delta encoding skipped every frame once motion
+  stopped, freezing the last motion-quality frame on screen. The encoder now gets
+  two refinement passes once things settle.
+- **Audio no longer shares the video socket.** Uncompressed audio queued behind
+  keyframes and was shed by video congestion as clicks. It now has its own
+  `/audio` connection and goes out as Int16 rather than Float32 (half the
+  bandwidth).
+- **Stale decoder configs.** When the encoder's parameter sets changed mid-stream,
+  clients kept the init segment they were first given.
+
+### Changed
+- **Bitrate is decided server-side** from measured send-queue delay rather than
+  by the client from RTT on an idle socket. The Bitrate setting is now a ceiling,
+  and the HUD reports what the server actually settled on. The client-side "Auto
+  Quality" toggle is gone.
+- **The cursor is drawn by the browser** (Settings → Video → Client-Rendered
+  Cursor, default on): no round trip to see your own pointer move, and a mouse
+  move no longer dirties an otherwise idle frame.
+- **Capture matches the client's viewport**, snapped to a short ladder, so a
+  2560 px stream is not encoded for a 900 px window.
+- **Encoding**: VideoToolbox low-latency rate control with a per-frame QP cap
+  (a quality floor for text), two frames in flight rather than one, and 420v
+  capture so the encoder no longer colour-converts every frame.
+- Glass-to-glass latency is measured from capture rather than from broadcast, and
+  the HUD and CSV export gained decoder latency and skipped-frame counts.
+- Mouse input uses `pointerrawupdate` where available.
+
 ## [0.1.0] - 2026-06-16
 
 Initial public release.

@@ -11,13 +11,17 @@ struct CursorMessage: Codable {
     /// the client needs to know nothing about capture resolution or scaling.
     var x: Double
     var y: Double
-    var hx: Double          // hotspot within the image
-    var hy: Double
-    var w: Double
-    var h: Double
+    var hx: Double?         // hotspot within the image
+    var hy: Double?
+    var w: Double?
+    var h: Double?
     /// Base64 PNG. Sent only when the shape actually changes — the position
     /// update that carries it is otherwise identical.
     var png: String?
+    /// Set when the system cursor could not be read. The screen is captured
+    /// without a cursor, so the client must draw its own native pointer rather
+    /// than leave the user with none at all.
+    var fallback: Bool?
 
     func jsonString() -> String {
         guard let data = try? JSONEncoder().encode(self) else { return "{}" }
@@ -97,7 +101,16 @@ final class CursorTracker {
         guard moved || shapeChanged else { return }
         lastPoint = point
 
-        guard let shape = currentShape else { return }
+        guard let shape = currentShape else {
+            // No readable system cursor. Still report the position and tell the
+            // client to show its own pointer — the alternative is a remote
+            // desktop with no cursor anywhere, which is far worse than a
+            // generic arrow.
+            onUpdate(CursorMessage(x: (point.x - bounds.origin.x) / bounds.width,
+                                   y: (point.y - bounds.origin.y) / bounds.height,
+                                   fallback: true).jsonString())
+            return
+        }
         let message = CursorMessage(
             x: (point.x - bounds.origin.x) / bounds.width,
             y: (point.y - bounds.origin.y) / bounds.height,

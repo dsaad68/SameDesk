@@ -19,6 +19,9 @@
      why it has no latency at all. */
   #cursor { position: fixed; z-index: 5; pointer-events: none; will-change: transform;
     image-rendering: -webkit-optimize-contrast; }
+  /* Fallback when the server cannot read the system cursor shape: show the
+     browser's own pointer rather than none at all. */
+  body.nativeCursor #screen, body.nativeCursor #canvas { cursor: default; }
 
   .glass {
     position: fixed; z-index: 10; color: #f5f5f7;
