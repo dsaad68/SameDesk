@@ -319,6 +319,10 @@ actor Broadcaster {
         return peak
     }
 
+    /// Identifiers of the currently connected input clients. Used to drop
+    /// viewport reports from browsers that have since gone away.
+    func inputClientIDs() -> Set<UUID> { Set(inputClients.keys) }
+
     /// Deepest per-client queue right now (diagnostics only).
     func maxQueuedFrameCount() -> Int {
         clients.values.reduce(0) { max($0, $1.queuedFrameCount) }

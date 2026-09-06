@@ -33,6 +33,8 @@ final class SameDeskServer {
     var onClipboard: ((String) -> Void)?
     /// Called when a client requests a fresh keyframe (e.g. after a decode error).
     var onRequestKeyframe: (() -> Void)?
+    /// Called when a client reports the size it is displaying the stream at.
+    var onViewport: ((UUID, Int, Int) -> Void)?
 
     private var serverTask: Task<Void, Error>?
 
@@ -312,6 +314,10 @@ final class SameDeskServer {
             }
         case .keyframe:
             onRequestKeyframe?()
+        case .viewport:
+            if let width = message.w, let height = message.h {
+                onViewport?(client.id, width, height)
+            }
         case .bitrate, .pong, .unknown:
             // `bitrate` is legacy: quality is now decided server-side from the
             // measured send-queue delay, so a stale cached client asking for a

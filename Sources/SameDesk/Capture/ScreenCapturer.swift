@@ -55,6 +55,11 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastRefinementTime: Double = 0
     private var refinementTimer: DispatchSourceTimer?
 
+    /// Point size of the display being captured, and the current capture size.
+    private var displaySize: (width: Int, height: Int) = (0, 0)
+    private var maxCaptureEdge = 2560
+    private(set) var captureSize: (width: Int, height: Int) = (0, 0)
+
     init(encoder: H264Encoder) {
         self.encoder = encoder
         super.init()
@@ -88,42 +93,16 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
 
-        let config = SCStreamConfiguration()
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        // 4:2:0 is what the hardware encoder consumes. Capturing BGRA made
-        // VideoToolbox convert every single frame before it could start work;
-        // asking ScreenCaptureKit for 420v hands the encoder what it wants.
-        // (Apple's own guidance: BGRA for on-screen display, 420v for encoding.)
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
-        // We drop frames when the encoder is full rather than let them back up,
-        // so depth is not latency here — it is headroom. It has to cover the
-        // frames the encoder holds in flight plus the one we cache for
-        // keyframe-on-connect, or ScreenCaptureKit starves waiting for surfaces.
-        config.queueDepth = 5
-        config.showsCursor = showsCursor
-
-        if let downscale {
-            config.width = downscale.width
-            config.height = downscale.height
-        } else {
-            // Capture at the display's POINT resolution by default, capped to a
-            // 2560 px long edge. Native Retina backing is ~4x the pixels, which
-            // makes the encoder drop frames (stutter) on a busy screen; point
-            // resolution is plenty sharp and keeps 60 fps comfortably. Users who
-            // want pixel-perfect text can pick a higher downscale size.
-            let (w, h) = Self.cappedDimensions(width: display.width, height: display.height, maxEdge: 2560)
-            config.width = w
-            config.height = h
-        }
-        config.scalesToFit = true
-
-        if audioEnabled {
-            config.capturesAudio = true
-            config.sampleRate = 48_000
-            config.channelCount = 2
-            config.excludesCurrentProcessAudio = true   // don't capture our own output
-        }
+        displaySize = (display.width, display.height)
+        // Capture at the display's POINT resolution by default, capped to a
+        // 2560 px long edge. Native Retina backing is ~4x the pixels, which makes
+        // the encoder drop frames (stutter) on a busy screen; point resolution is
+        // plenty sharp and keeps 60 fps comfortably. A downscale preset lowers
+        // that ceiling; a client's viewport can lower it further at runtime.
+        maxCaptureEdge = downscale.map { max($0.width, $0.height) } ?? 2560
+        captureSize = Self.cappedDimensions(width: display.width, height: display.height,
+                                            maxEdge: maxCaptureEdge)
+        let config = makeConfiguration(width: captureSize.width, height: captureSize.height)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
@@ -167,9 +146,70 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         encoder.encode(pixelBuffer: buffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
     }
 
+    private func makeConfiguration(width: Int, height: Int) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        // 4:2:0 is what the hardware encoder consumes. Capturing BGRA made
+        // VideoToolbox convert every single frame before it could start work;
+        // asking ScreenCaptureKit for 420v hands the encoder what it wants.
+        // (Apple's own guidance: BGRA for on-screen display, 420v for encoding.)
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        // We drop frames when the encoder is full rather than let them back up,
+        // so depth is not latency here — it is headroom. It has to cover the
+        // frames the encoder holds in flight plus the one we cache for
+        // keyframe-on-connect, or ScreenCaptureKit starves waiting for surfaces.
+        config.queueDepth = 5
+        config.showsCursor = showsCursor
+        config.width = width
+        config.height = height
+        config.scalesToFit = true
+
+        if audioEnabled {
+            config.capturesAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+            config.excludesCurrentProcessAudio = true   // don't capture our own output
+        }
+        return config
+    }
+
+    /// Match the capture size to what the client is actually displaying.
+    ///
+    /// Capturing 2560 px wide only to have the browser scale it into a 900 px
+    /// window wastes encode time and bandwidth, and resamples text twice — once
+    /// by 4:2:0 subsampling and again by the browser. ScreenCaptureKit can be
+    /// reconfigured in place, so this does not interrupt the stream.
+    ///
+    /// The request is snapped onto a short ladder so dragging a window does not
+    /// reconfigure the stream continuously, and it can only ever go below the
+    /// ceiling chosen at start.
+    func updateCaptureSize(requestedLongEdge: Int) async {
+        guard let stream, displaySize.width > 0, displaySize.height > 0 else { return }
+        let edge = Self.ladderEdge(forRequested: requestedLongEdge, cap: maxCaptureEdge)
+        let size = Self.cappedDimensions(width: displaySize.width, height: displaySize.height,
+                                         maxEdge: edge)
+        guard size.width > 0, size.height > 0, size != captureSize else { return }
+        do {
+            try await stream.updateConfiguration(makeConfiguration(width: size.width,
+                                                                   height: size.height))
+            captureSize = size
+        } catch {
+            NSLog("SameDesk: capture resize to \(size.width)x\(size.height) failed: \(error)")
+        }
+    }
+
+    /// Snap a requested long edge onto a short ladder, never above `cap`.
+    /// Matching a viewport exactly would mean reconfiguring on every window drag.
+    static func ladderEdge(forRequested requested: Int, cap: Int) -> Int {
+        let ladder = [1280, 1600, 1920, 2240, 2560]
+        guard requested > 0 else { return cap }
+        return min(ladder.first { $0 >= requested } ?? cap, cap)
+    }
+
     /// Scale dimensions down so the long edge is at most `maxEdge`, preserving
     /// aspect ratio. (Dimensions are forced even so H.264 is happy.)
-    static func cappedDimensions(width: Int, height: Int, maxEdge: Int) -> (Int, Int) {
+    static func cappedDimensions(width: Int, height: Int, maxEdge: Int) -> (width: Int, height: Int) {
         let longest = max(width, height)
         var w = width, h = height
         if longest > maxEdge {

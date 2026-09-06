@@ -441,9 +441,25 @@
     };
   }
 
+  // Tell the server how big we are drawing the stream, so it can capture at a
+  // size that matches instead of encoding pixels the browser will throw away.
+  // Debounced: a window drag should not reconfigure the capture stream.
+  let viewportTimer = null;
+  function sendViewport() {
+    const dpr = window.devicePixelRatio || 1;
+    sendInput({ type: "viewport",
+                w: Math.round(window.innerWidth * dpr),
+                h: Math.round(window.innerHeight * dpr) });
+  }
+  window.addEventListener("resize", () => {
+    clearTimeout(viewportTimer);
+    viewportTimer = setTimeout(sendViewport, 800);
+  });
+
   function connectInput() {
     clearTimeout(inputTimer);
     inputWS = new WebSocket(inputURL);
+    inputWS.onopen = () => sendViewport();
     inputWS.onclose = () => { inputTimer = setTimeout(connectInput, 1500); };
     inputWS.onmessage = (ev) => { if (typeof ev.data === "string") handleControl(JSON.parse(ev.data)); };
   }

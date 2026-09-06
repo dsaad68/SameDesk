@@ -27,6 +27,8 @@ final class AppCoordinator {
     private var congestion: CongestionController?
     /// Latest peak send-queue delay (seconds), surfaced in diagnostics.
     private(set) var lastQueueDelay: Double = 0
+    /// Long edge, in device pixels, each connected client is displaying at.
+    private var clientViewports: [UUID: Int] = [:]
     /// Latest MSE codec string, written by the consumer task and read (sync) by
     /// the page handler. Locked because those run in different domains.
     private let codecHolder = OSAllocatedUnfairLock(initialState: "avc1.640033")
@@ -198,6 +200,9 @@ final class AppCoordinator {
             encoder?.requestKeyframe()
             capturer?.emitKeyframeFromCache()
         }
+        server.onViewport = { [weak self] id, width, height in
+            Task { @MainActor in self?.noteViewport(id, longEdge: max(width, height)) }
+        }
         do {
             try server.start(config: .init(bindAddress: iface.ipv4, port: Settings.shared.port,
                                            certPath: identity.certURL.path, keyPath: identity.keyURL.path))
@@ -227,6 +232,7 @@ final class AppCoordinator {
         congestionTask?.cancel(); congestionTask = nil
         congestion = nil
         lastQueueDelay = 0
+        clientViewports.removeAll()
         encoder?.invalidate(); encoder = nil
         virtualDisplay.tearDown()
         muxer.reset()
@@ -419,6 +425,7 @@ final class AppCoordinator {
         Queue:     \(String(format: "%.0f", lastQueueDelay * 1000)) ms send delay
         Delta:     \(Settings.shared.deltaEncoding ? "on" : "off")
         Display:   \(dw)×\(dh)  (downscale: \(downscale))
+        Capture:   \(capturer?.captureSize.width ?? 0)×\(capturer?.captureSize.height ?? 0)
         Audio:     \(Settings.shared.audioEnabled ? "on" : "off")
         Cursor:    \(Settings.shared.localCursor ? "client-rendered" : "in stream")
 
@@ -516,6 +523,25 @@ final class AppCoordinator {
         // frames as stale. Fall back to "now" rather than lie.
         guard age.isFinite, age >= 0, age < 5 else { return nowMs }
         return nowMs - age * 1000
+    }
+
+    /// A client told us how big it is drawing the stream. Capturing 2560 px wide
+    /// for a 900 px window costs encode time and bandwidth, and resamples text
+    /// twice on the way.
+    private func noteViewport(_ id: UUID, longEdge: Int) {
+        guard longEdge > 0 else { return }
+        clientViewports[id] = longEdge
+        Task { await applyViewportSizing() }
+    }
+
+    private func applyViewportSizing() async {
+        guard let capturer else { return }
+        let active = await broadcaster.inputClientIDs()
+        clientViewports = clientViewports.filter { active.contains($0.key) }
+        // The largest viewer wins: shrinking the stream for everyone because a
+        // phone joined would be the wrong trade.
+        guard let longest = clientViewports.values.max() else { return }
+        await capturer.updateCaptureSize(requestedLongEdge: longest)
     }
 
     /// Sample the send-queue delay on a fixed tick and let the bitrate policy

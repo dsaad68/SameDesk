@@ -8,7 +8,8 @@ enum InputMessageType: String, Codable {
     case text          // printable / IME text, injected via Unicode
     case clipboard     // clipboard text (both directions)
     case ping, pong    // latency probe
-    case bitrate       // client-driven connection auto-tune (target Mbps)
+    case bitrate       // legacy: client-driven bitrate, now decided server-side
+    case viewport      // client's displayed size, so capture can match it
     case keyframe      // client asks for a fresh IDR (e.g. after a decode error)
     case unknown
 
@@ -49,8 +50,12 @@ struct InputMessage: Codable {
     // Ping/pong timestamp (ms since epoch, client clock).
     var t: Double?
 
-    // Auto-tune target bitrate (Mbps).
+    // Auto-tune target bitrate (Mbps). Legacy; ignored.
     var mbps: Double?
+
+    // Client viewport in device pixels, for capture sizing.
+    var w: Int?
+    var h: Int?
 }
 
 /// Outbound JSON messages (server -> browser).

@@ -38,7 +38,7 @@ final class InputController {
             handleKey(message, down: false)
         case .text:
             handleText(message)
-        case .clipboard, .ping, .pong, .bitrate, .keyframe, .unknown:
+        case .clipboard, .ping, .pong, .bitrate, .keyframe, .viewport, .unknown:
             break // handled elsewhere / ignored here
         }
     }
