@@ -37,16 +37,18 @@ test("HUD shows the stat rows and can be hidden and reopened", async ({ page }) 
   await expect(hud).not.toHaveClass(/hidden/);
 });
 
-test("auto-quality control toggles", async ({ page }) => {
+test("HUD reports the bitrate the server settled on", async ({ page }) => {
   await page.goto("/");
 
-  const aq = page.locator("#autoquality");
-  await expect(aq).toHaveText("Auto Quality: On");
-  await expect(aq).toHaveClass(/active/);
+  // Quality is server-owned now: until the server says otherwise there is
+  // nothing to report.
+  await expect(page.locator("#quality")).toHaveText("–");
 
-  await aq.click();
-  await expect(aq).toHaveText("Auto Quality: Off");
-  await expect(aq).not.toHaveClass(/active/);
+  // __sdSockets[1] is the /input socket (the media socket connects first).
+  await page.evaluate(() =>
+    window.__sdSockets[1].emit(JSON.stringify({ type: "quality", mbps: 6.5 })));
+
+  await expect(page.locator("#quality")).toHaveText("6.5 Mbps");
 });
 
 test("shortcut-passthrough (keyboard lock) engages", async ({ page }) => {

@@ -60,17 +60,24 @@ struct OutboundMessage: Codable {
     var t: Double?       // echoed ping timestamp for RTT
     var s: Double?       // server wall-clock (ms) for clock-offset estimation
     var codec: String?   // video codec string for the client decoder ("config")
+    var mbps: Double?    // current server-side bitrate target ("quality")
 
     static func clipboard(_ text: String) -> OutboundMessage {
-        OutboundMessage(type: "clipboard", text: text, t: nil, s: nil, codec: nil)
+        OutboundMessage(type: "clipboard", text: text)
     }
     static func pong(_ t: Double?) -> OutboundMessage {
-        OutboundMessage(type: "pong", text: nil, t: t, s: Date().timeIntervalSince1970 * 1000, codec: nil)
+        OutboundMessage(type: "pong", t: t, s: Date().timeIntervalSince1970 * 1000)
     }
     /// Sent as the first text frame on a new media socket so the browser knows
     /// which codec to configure its decoder for, before any binary segment.
     static func config(codec: String) -> OutboundMessage {
-        OutboundMessage(type: "config", text: nil, t: nil, s: nil, codec: codec)
+        OutboundMessage(type: "config", codec: codec)
+    }
+    /// Bitrate the server has settled on. Quality is decided server-side (the
+    /// send-queue delay is only observable there), so the HUD reports this
+    /// rather than a number the client picked for itself.
+    static func quality(mbps: Double) -> OutboundMessage {
+        OutboundMessage(type: "quality", mbps: mbps)
     }
 
     func jsonString() -> String {

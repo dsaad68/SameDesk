@@ -22,6 +22,11 @@ final class AppCoordinator {
     private var capturer: ScreenCapturer?
     private var frameConsumer: Task<Void, Never>?
     private var audioConsumer: Task<Void, Never>?
+    private var congestionTask: Task<Void, Never>?
+    /// Server-side bitrate policy, driven by measured send-queue delay.
+    private var congestion: CongestionController?
+    /// Latest peak send-queue delay (seconds), surfaced in diagnostics.
+    private(set) var lastQueueDelay: Double = 0
     /// Latest MSE codec string, written by the consumer task and read (sync) by
     /// the page handler. Locked because those run in different domains.
     private let codecHolder = OSAllocatedUnfairLock(initialState: "avc1.640033")
@@ -133,7 +138,9 @@ final class AppCoordinator {
         let encoder = H264Encoder(bitrate: Settings.shared.bitrateBps,
                                   codec: Settings.shared.useHEVC ? .hevc : .h264)
         self.encoder = encoder
+        congestion = CongestionController(config: .init(maxBps: Settings.shared.bitrateBps))
         startFrameConsumer(encoder: encoder)
+        startCongestionController()
 
         // 6. Capture.
         let capturer = ScreenCapturer(encoder: encoder)
@@ -178,12 +185,6 @@ final class AppCoordinator {
             encoder?.requestKeyframe()
             capturer?.emitKeyframeFromCache()
         }
-        server.onSetBitrate = { [weak self] mbps in
-            // Connection auto-tune: clamp to a sane window and apply live. We do
-            // NOT persist this (it's transient adaptation, not a user setting).
-            let bps = Int(min(max(mbps, 0.5), 40) * 1_000_000)
-            Task { @MainActor in self?.encoder?.setBitrate(bps) }
-        }
         do {
             try server.start(config: .init(bindAddress: iface.ipv4, port: Settings.shared.port,
                                            certPath: identity.certURL.path, keyPath: identity.keyURL.path))
@@ -209,6 +210,9 @@ final class AppCoordinator {
         await capturer?.stop(); capturer = nil
         frameConsumer?.cancel(); frameConsumer = nil
         audioConsumer?.cancel(); audioConsumer = nil
+        congestionTask?.cancel(); congestionTask = nil
+        congestion = nil
+        lastQueueDelay = 0
         encoder?.invalidate(); encoder = nil
         virtualDisplay.tearDown()
         muxer.reset()
@@ -247,7 +251,14 @@ final class AppCoordinator {
 
     func setBitrate(_ bps: Int) {
         Settings.shared.bitrateBps = bps
-        encoder?.setBitrate(bps)
+        // The user's value is the ceiling; the controller may still hold below it
+        // while the link is congested.
+        if congestion != nil {
+            let applied = congestion?.setCeiling(bps)
+            encoder?.setBitrate(applied ?? congestion?.targetBps ?? bps)
+        } else {
+            encoder?.setBitrate(bps)
+        }
         notify()
     }
 
@@ -383,7 +394,8 @@ final class AppCoordinator {
         Clients:   \(clients) connected
 
         Codec:     \(Settings.shared.useHEVC ? "HEVC" : "H.264") (\(codec))
-        Bitrate:   \(String(format: "%.0f", bitrateMbps)) Mbps target
+        Bitrate:   \(String(format: "%.1f", currentBitrateMbps)) Mbps of \(String(format: "%.0f", bitrateMbps)) Mbps ceiling
+        Queue:     \(String(format: "%.0f", lastQueueDelay * 1000)) ms send delay
         Delta:     \(Settings.shared.deltaEncoding ? "on" : "off")
         Display:   \(dw)×\(dh)  (downscale: \(downscale))
         Audio:     \(Settings.shared.audioEnabled ? "on" : "off")
@@ -397,6 +409,12 @@ final class AppCoordinator {
 
         App:       SameDesk \(version) · \(ProcessInfo.processInfo.operatingSystemVersionString) · arm64
         """
+    }
+
+    /// Bitrate the encoder is actually targeting. The controller may hold this
+    /// below the user's configured ceiling while the link is congested.
+    private var currentBitrateMbps: Double {
+        Double(congestion?.targetBps ?? Settings.shared.bitrateBps) / 1_000_000
     }
 
     /// Native pixel dimensions of the display we capture (falls back to point size).
@@ -426,7 +444,12 @@ final class AppCoordinator {
         // consumer that owns the muxer and awaits the broadcaster in order.
         let (stream, continuation) = AsyncStream<EncodedFrame>.makeStream(
             bufferingPolicy: .bufferingNewest(8))
-        encoder.onEncodedFrame = { frame in continuation.yield(frame) }
+        encoder.onEncodedFrame = { [weak encoder] frame in
+            // A dropped frame here would break EVERY client's reference chain —
+            // the decoders would be predicting from a picture nobody received.
+            // Force an IDR instead of shipping deltas into the gap.
+            if case .dropped = continuation.yield(frame) { encoder?.requestKeyframe() }
+        }
 
         let muxer = self.muxer
         let broadcaster = self.broadcaster
@@ -443,11 +466,57 @@ final class AppCoordinator {
                 // On a keyframe, hand a fresh init segment along so the
                 // broadcaster can lazily deliver it to newly-connected clients.
                 let initSeg: Data? = frame.isKeyframe ? muxer.buildInitSegment() : nil
-                let captureTimeMs = Date().timeIntervalSince1970 * 1000
+                let captureTimeMs = Self.wallClockMs(forCapturePTS: frame.pts)
                 await broadcaster.broadcast(fragment: fragment, isKeyframe: frame.isKeyframe,
                                             initSegment: initSeg, captureTimeMs: captureTimeMs)
             }
         }
+    }
+
+    /// Translate a capture presentation timestamp (ScreenCaptureKit stamps
+    /// frames on the mach host clock) into epoch milliseconds.
+    ///
+    /// This used to be `Date()` at broadcast time, which quietly excluded capture
+    /// and encode from the client's "glass-to-glass" readout — and, worse, gave
+    /// the client no way to tell how stale a frame it just received is.
+    nonisolated static func wallClockMs(forCapturePTS pts: CMTime) -> Double {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        guard pts.isValid else { return nowMs }
+        let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+        let age = CMTimeGetSeconds(CMTimeSubtract(hostNow, pts))
+        // Guard against an unexpected clock domain: a nonsensical age would show
+        // up as a wild latency reading and, worse, make the client treat live
+        // frames as stale. Fall back to "now" rather than lie.
+        guard age.isFinite, age >= 0, age < 5 else { return nowMs }
+        return nowMs - age * 1000
+    }
+
+    /// Sample the send-queue delay on a fixed tick and let the bitrate policy
+    /// react. 250 ms is fast enough to catch a Wi-Fi blip within a few frames
+    /// and slow enough that we are not reconfiguring the encoder constantly.
+    private func startCongestionController() {
+        let broadcaster = self.broadcaster
+        congestionTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if Task.isCancelled { return }
+                let peak = await broadcaster.drainPeakWriteDelay()
+                self?.applyCongestionSample(peak)
+            }
+        }
+    }
+
+    private func applyCongestionSample(_ peakWriteDelay: Double) {
+        lastQueueDelay = peakWriteDelay
+        guard var controller = congestion else { return }
+        let newBitrate = controller.update(peakWriteDelay: peakWriteDelay)
+        congestion = controller
+        guard let newBitrate else { return }
+        encoder?.setBitrate(newBitrate)
+        // Tell the client what it is actually getting, so the HUD reports the
+        // real target instead of a number it made up itself.
+        let message = OutboundMessage.quality(mbps: Double(newBitrate) / 1_000_000).jsonString()
+        Task { await broadcaster.broadcastText(message) }
     }
 
     private func notify() { for observer in stateObservers { observer() } }

@@ -31,12 +31,19 @@ final class SameDeskServer {
     var onInput: ((InputMessage) -> Void)?
     /// Called when a browser pushes clipboard text (Browser -> Mac).
     var onClipboard: ((String) -> Void)?
-    /// Called when a client requests a target bitrate (Mbps) for auto-tune.
-    var onSetBitrate: ((Double) -> Void)?
     /// Called when a client requests a fresh keyframe (e.g. after a decode error).
     var onRequestKeyframe: (() -> Void)?
 
     private var serverTask: Task<Void, Error>?
+
+    /// Kernel send-buffer ceiling per connection.
+    ///
+    /// macOS auto-tunes SO_SNDBUF into the megabytes, which hides congestion
+    /// completely: `write` returns instantly while seconds of stale video pile
+    /// up below us. Capping it keeps the write completion meaningful (it is our
+    /// congestion signal) and bounds how much stale video a blip can strand.
+    /// 256 KB still sustains hundreds of Mbps at LAN round-trip times.
+    private static let sendBufferBytes: Int32 = 256 * 1024
 
     init(broadcaster: Broadcaster, tokenStore: TokenStore, codecProvider: @escaping () -> String) {
         self.broadcaster = broadcaster
@@ -123,7 +130,20 @@ final class SameDeskServer {
             configuration: .init(
                 address: .hostname(config.bindAddress, port: config.port),
                 serverName: "SameDesk"
-            )
+            ),
+            onServerRunning: { channel in
+                // Darwin copies the listening socket's buffer sizes onto every
+                // accepted socket, so setting it once here covers all clients.
+                // Best-effort: if the option is refused we lose signal quality,
+                // not correctness — the shallow per-client queue and the
+                // stale-write purge still bound how far behind a client can get.
+                do {
+                    try await channel.setOption(ChannelOptions.socketOption(.so_sndbuf),
+                                                value: SameDeskServer.sendBufferBytes).get()
+                } catch {
+                    NSLog("SameDesk: could not set SO_SNDBUF: \(error)")
+                }
+            }
         )
 
         serverTask = Task {
@@ -150,18 +170,19 @@ final class SameDeskServer {
         outbound: WebSocketOutboundWriter
     ) async {
         let client = ClientConnection()
+        let broadcaster = self.broadcaster
         // First frame on this socket: tell the client which codec to set up.
         // Enqueued BEFORE broadcaster.add() can push any binary init segment, so
         // the client always learns the codec before the first fragment arrives.
-        client.enqueue(.text(OutboundMessage.config(codec: codecProvider()).jsonString()))
+        client.enqueue(.text(OutboundMessage.config(codec: codecProvider()).jsonString()), isMedia: false)
         await broadcaster.add(client)
         defer { Task { await broadcaster.remove(client.id) } }
 
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
-                for await frame in client.stream {
+                while let item = await client.next() {
                     do {
-                        switch frame {
+                        switch item.frame {
                         case .binary(let data):
                             try await outbound.write(.binary(ByteBuffer(data: data)))
                         case .text(let text):
@@ -169,6 +190,15 @@ final class SameDeskServer {
                         }
                     } catch {
                         break // socket dead; drop this client
+                    }
+                    // The write completes once the kernel has taken the bytes, so
+                    // this gap is real queueing delay on the link — the signal the
+                    // bitrate controller runs on. A long one also means everything
+                    // queued behind it is stale, so shed it and resync on an IDR
+                    // rather than play a backlog out at fast-forward.
+                    guard item.isMedia else { continue }
+                    if client.recordWriteDelay(MonotonicClock.now - item.enqueuedAt) {
+                        await broadcaster.clientFellBehind(client.id)
                     }
                 }
             }
@@ -193,9 +223,9 @@ final class SameDeskServer {
 
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
-                for await frame in client.stream {
+                while let item = await client.next() {
                     do {
-                        if case .text(let text) = frame {
+                        if case .text(let text) = item.frame {
                             try await outbound.write(.text(text))
                         }
                     } catch {
@@ -227,18 +257,19 @@ final class SameDeskServer {
         switch message.type {
         case .ping:
             let pong = OutboundMessage.pong(message.t).jsonString()
-            client.enqueue(.text(pong))
+            client.enqueue(.text(pong), isMedia: false)
         case .clipboard:
             if let clip = message.text {
                 onClipboard?(clip)
                 // Mirror to other clients so all sessions stay in sync.
                 await broadcaster.broadcastText(OutboundMessage.clipboard(clip).jsonString(), except: client.id)
             }
-        case .bitrate:
-            if let mbps = message.mbps { onSetBitrate?(mbps) }
         case .keyframe:
             onRequestKeyframe?()
-        case .pong, .unknown:
+        case .bitrate, .pong, .unknown:
+            // `bitrate` is legacy: quality is now decided server-side from the
+            // measured send-queue delay, so a stale cached client asking for a
+            // rate can no longer fight the controller.
             break
         default:
             onInput?(message)

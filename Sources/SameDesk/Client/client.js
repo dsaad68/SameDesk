@@ -78,12 +78,22 @@
   }
 
   // ---- WebCodecs sink -----------------------------------------------------
+  // Decoding every queued chunk in order is the wrong thing for a live stream:
+  // after a network stall it plays the whole backlog back-to-back (a freeze
+  // followed by a fast-forward) instead of showing the present. So we watch how
+  // far behind we are and, when it matters, skip to the next keyframe.
+  const MAX_DECODE_QUEUE = 3;     // chunks waiting on the decoder before we shed
+  const STALE_FRAME_MS = 250;     // frame age past which the backlog is worthless
+
   const WebCodecsSink = (() => {
     let decoder = null, configured = false, ts = 0, waitingKey = true, codecKind = "avc";
+    let tsBase = null;
+    const submitTimes = new Map();   // chunk timestamp -> performance.now() at submit
 
     function init() {
       // Reset state so init() is safe to call again on reconnect.
       configured = false; waitingKey = true; ts = 0; codecKind = "avc";
+      tsBase = null; submitTimes.clear();
       try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (_) {}
       decoder = new VideoDecoder({
         output: (frame) => {
@@ -93,11 +103,32 @@
             mediaSize = { w: frame.displayWidth, h: frame.displayHeight };
           }
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          const submitted = submitTimes.get(frame.timestamp);
+          if (submitted !== undefined) {
+            submitTimes.delete(frame.timestamp);
+            Stats.onDecode(performance.now() - submitted);
+          }
           frame.close();
           Stats.onFrame();
         },
         error: (e) => { setStatus("Decoder error: " + e.message, true); waitingKey = true; requestKeyframe(); },
       });
+    }
+
+    // Chunk timestamps must be monotonic; feeding the real capture time (rather
+    // than a synthetic 60fps counter) is what lets us measure decode latency and
+    // spot a decoder that is buffering frames internally.
+    function nextTimestamp(captureMs) {
+      let t;
+      if (typeof captureMs === "number" && isFinite(captureMs)) {
+        if (tsBase === null) tsBase = captureMs;
+        t = Math.round((captureMs - tsBase) * 1000);
+      } else {
+        t = ts + 16666;
+      }
+      if (t <= ts) t = ts + 1;
+      ts = t;
+      return t;
     }
 
     function configure(record) {
@@ -114,8 +145,7 @@
       }
     }
 
-    function pushSegment(buf) {
-      const bytes = new Uint8Array(buf);
+    function pushSegment(bytes, meta) {
       if (isInitSegment(bytes)) {
         // The init segment is self-describing: hvcC => HEVC, avcC => H.264.
         let rec = boxPayload(bytes, "hvcC");
@@ -128,15 +158,32 @@
       const sample = boxPayload(bytes, "mdat");
       if (!sample) return;
       const key = containsKeyframe(sample, codecKind);
-      if (waitingKey && !key) return;        // start on a keyframe
+      if (!key) {
+        if (waitingKey) return;            // start (and restart) on a keyframe
+        // Behind live: either the decoder is backing up or the frame we are
+        // holding is already old. Both mean the queued deltas are worthless —
+        // skip to the next keyframe instead of replaying the past at speed.
+        const stale = meta && meta.ageMs !== null && meta.ageMs > STALE_FRAME_MS;
+        if (decoder.decodeQueueSize > MAX_DECODE_QUEUE || stale) {
+          waitingKey = true;
+          Stats.onSkip();
+          requestKeyframe();
+          return;
+        }
+      }
       waitingKey = false;
       try {
+        const timestamp = nextTimestamp(meta && meta.captureMs);
+        submitTimes.set(timestamp, performance.now());
+        // Bound the map: a frame the decoder never emits must not leak.
+        if (submitTimes.size > 64) {
+          submitTimes.delete(submitTimes.keys().next().value);
+        }
         decoder.decode(new EncodedVideoChunk({
           type: key ? "key" : "delta",
-          timestamp: ts,
+          timestamp,
           data: sample,
         }));
-        ts += 16666; // ~60fps in microseconds; only needs to be monotonic
       } catch (e) {
         // A decode error usually means we need a fresh keyframe.
         waitingKey = true;
@@ -189,14 +236,14 @@
       if (video.paused) video.play().catch(() => {});
       mediaSize = { w: video.videoWidth || 16, h: video.videoHeight || 9 };
     }
-    function pushSegment(buf) { queue.push(new Uint8Array(buf)); flush(); manageLatency(); }
+    function pushSegment(bytes) { queue.push(bytes); flush(); manageLatency(); }
     return { init, pushSegment, name: "MSE" };
   })();
 
   // ---- Stats / HUD --------------------------------------------------------
   const Stats = (() => {
     let frameCount = 0, byteCount = 0, lastTick = performance.now();
-    let latency = 0, e2e = 0, e2ePeak = 0;
+    let latency = 0, e2e = 0, e2ePeak = 0, decodeMs = 0, skipped = 0;
     const history = [];
     const samples = [];          // rolling per-second records (last 5 min)
     const MAX_SAMPLES = 300;
@@ -204,6 +251,11 @@
 
     function onSegment(bytes) { byteCount += bytes; }
     function onFrame() { frameCount++; }
+    // Decoder submit -> output. More than one frame interval here means the
+    // decoder is holding frames back (see the SPS reorder-window note in the
+    // muxer), which is latency no amount of network tuning can recover.
+    function onDecode(ms) { decodeMs = decodeMs ? decodeMs * 0.8 + ms * 0.2 : ms; }
+    function onSkip() { skipped++; }
     function onLatency(ms) { latency = ms; }
     function currentLatency() { return latency; }
     // Glass-to-glass: server capture time -> client receive, clock-corrected.
@@ -222,10 +274,13 @@
       const peak = e2ePeak;
       document.getElementById("e2e").textContent =
         e2e ? `${e2e.toFixed(0)} ms (pk ${peak.toFixed(0)})` : "–";
-      e2ePeak = 0;
+      document.getElementById("decode").textContent =
+        decodeMs ? `${decodeMs.toFixed(1)} ms` : "–";
+      const skips = skipped;
+      e2ePeak = 0; skipped = 0;
 
       samples.push({ t: Date.now(), fps, mbps: kbps / 1000, rttMs: latency,
-                     e2eMs: e2e, e2ePeakMs: peak });
+                     e2eMs: e2e, e2ePeakMs: peak, decodeMs, skipped: skips });
       if (samples.length > MAX_SAMPLES) samples.shift();
 
       history.push(kbps); if (history.length > 110) history.shift();
@@ -233,11 +288,12 @@
     }, 1000);
 
     function exportCSV() {
-      const header = "timestamp,fps,mbps,rtt_ms,e2e_ms,e2e_peak_ms";
+      const header = "timestamp,fps,mbps,rtt_ms,e2e_ms,e2e_peak_ms,decode_ms,skipped";
       const lines = samples.map((r) => [
         new Date(r.t).toISOString(),
         r.fps.toFixed(1), r.mbps.toFixed(3), r.rttMs.toFixed(0),
         r.e2eMs.toFixed(0), r.e2ePeakMs.toFixed(0),
+        r.decodeMs.toFixed(1), r.skipped,
       ].join(","));
       return [header, ...lines].join("\n");
     }
@@ -251,7 +307,7 @@
       g.fillStyle = "rgba(10,132,255,0.35)"; g.fill();
       g.strokeStyle = "rgba(10,132,255,0.9)"; g.lineWidth = 1.5; g.stroke();
     }
-    return { onSegment, onFrame, onLatency, currentLatency, onE2E, exportCSV };
+    return { onSegment, onFrame, onLatency, currentLatency, onE2E, onDecode, onSkip, exportCSV };
   })();
 
   document.getElementById("hudExport").addEventListener("click", () => {
@@ -363,19 +419,24 @@
       const u8 = new Uint8Array(ev.data);
       if (u8[0] === 1) { AudioOut.push(ev.data); return; }
       if (!CODEC_ID) return;                       // wait for the config frame
-      // Video frame: [tag=0][captureTimeMs: Float64 BE][fMP4]
+      // Video frame: [tag=0][captureTimeMs: Float64 BE][fMP4]. captureTimeMs is
+      // stamped at CAPTURE (from the ScreenCaptureKit PTS), so the age below is
+      // true glass-to-glass and can be trusted to decide we are behind live.
       const captureMs = new DataView(ev.data).getFloat64(1, false);
-      if (haveOffset) Stats.onE2E(Date.now() - (captureMs - clockOffset));
+      let ageMs = null;
+      if (haveOffset) {
+        ageMs = Date.now() - (captureMs - clockOffset);
+        Stats.onE2E(ageMs);
+      }
       const payload = u8.subarray(9);            // strip tag + timestamp
       Stats.onSegment(payload.length);
-      sink.pushSegment(payload);
+      sink.pushSegment(payload, { captureMs, ageMs });
     };
   }
 
   function connectInput() {
     clearTimeout(inputTimer);
     inputWS = new WebSocket(inputURL);
-    inputWS.onopen = () => { if (autoQuality) sendInput({ type: "bitrate", mbps: targetMbps }); };
     inputWS.onclose = () => { inputTimer = setTimeout(connectInput, 1500); };
     inputWS.onmessage = (ev) => { if (typeof ev.data === "string") handleControl(JSON.parse(ev.data)); };
   }
@@ -397,6 +458,10 @@
         haveOffset = true;
       }
     }
+    else if (msg.type === "quality" && typeof msg.mbps === "number") {
+      targetMbps = msg.mbps;
+      updateQualityHUD();
+    }
     else if (msg.type === "clipboard" && msg.text != null) navigator.clipboard?.writeText(msg.text).catch(() => {});
     else if (msg.type === "reload") {
       // Server is restarting (settings/port change). Reload to recover cleanly —
@@ -407,30 +472,16 @@
     }
   }
 
-  // ---- Connection quality auto-tune (RTT-driven) -------------------------
-  let autoQuality = true;
-  let targetMbps = 8;
-  let goodCycles = 0;
+  // ---- Connection quality ------------------------------------------------
+  // Bitrate is decided on the server, from how long each frame waits to reach
+  // the socket. That signal only exists there, and it moves well before RTT
+  // does — a client-side RTT loop was both blind and fighting the user's own
+  // Bitrate setting. Here we just display what the server reports.
+  let targetMbps = null;
   function updateQualityHUD() {
     document.getElementById("quality").textContent =
-      autoQuality ? (targetMbps.toFixed(1) + " Mbps (auto)") : "manual";
+      targetMbps === null ? "–" : targetMbps.toFixed(1) + " Mbps";
   }
-  setInterval(() => {
-    if (!autoQuality) return;
-    const rtt = Stats.currentLatency();
-    let changed = false;
-    if (rtt > 250) { targetMbps = Math.max(1, +(targetMbps * 0.6).toFixed(1)); goodCycles = 0; changed = true; }
-    else if (rtt > 0 && rtt < 100) {
-      goodCycles++;
-      if (goodCycles >= 2) {
-        const nv = Math.min(20, +(targetMbps * 1.25).toFixed(1));
-        if (nv !== targetMbps) { targetMbps = nv; changed = true; }
-        goodCycles = 0;
-      }
-    } else goodCycles = 0;
-    if (changed) sendInput({ type: "bitrate", mbps: targetMbps });
-    updateQualityHUD();
-  }, 3000);
 
   // ---- Input geometry -----------------------------------------------------
   function displayedRect() {
@@ -515,15 +566,6 @@
     const on = locked();
     plBtn.textContent = "Pointer Lock: " + (on ? "On" : "Off");
     plBtn.classList.toggle("active", on);
-  });
-
-  const aqBtn = document.getElementById("autoquality");
-  aqBtn.addEventListener("click", () => {
-    autoQuality = !autoQuality;
-    aqBtn.textContent = "Auto Quality: " + (autoQuality ? "On" : "Off");
-    aqBtn.classList.toggle("active", autoQuality);
-    if (autoQuality) sendInput({ type: "bitrate", mbps: targetMbps });
-    updateQualityHUD();
   });
 
   const passBtn = document.getElementById("passthrough");
