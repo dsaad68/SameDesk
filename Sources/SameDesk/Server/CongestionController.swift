@@ -21,15 +21,17 @@ struct CongestionController {
         /// ever takes bandwidth away, never adds beyond what was asked for.
         var maxBps: Int
         /// Queueing delay that means we are already sending faster than the link
-        /// drains. Roughly 5 frames at 60 fps.
-        var highDelaySeconds = 0.09
+        /// drains. About 4 frames at 60 fps; the per-client queue holds 10, so
+        /// this fires before an overflow costs us a keyframe.
+        var highDelaySeconds = 0.06
         /// Delay low enough that probing upward is safe.
-        var lowDelaySeconds = 0.03
-        var decreaseFactor = 0.6
-        var increaseFactor = 1.08
+        var lowDelaySeconds = 0.025
+        var decreaseFactor = 0.7
+        var increaseFactor = 1.12
         /// Consecutive clean ticks before probing up, and again after a cut.
-        var cleanTicksBeforeIncrease = 4
-        var holdTicksAfterDecrease = 4
+        /// At a 200 ms tick: probe once a second, hold for a second after a cut.
+        var cleanTicksBeforeIncrease = 5
+        var holdTicksAfterDecrease = 5
     }
 
     private(set) var config: Config
@@ -48,8 +50,8 @@ struct CongestionController {
         return clampAndReport(min(targetBps, bps))
     }
 
-    /// Feed one observation. Call on a fixed tick (~250 ms) with the worst
-    /// enqueue→write delay seen since the previous call.
+    /// Feed one observation. Call on a fixed tick (~200 ms) with the worst
+    /// queueing delay seen since the previous call.
     /// - Returns: the new target bitrate if it changed materially, else nil.
     mutating func update(peakWriteDelay: Double) -> Int? {
         if peakWriteDelay > config.highDelaySeconds {

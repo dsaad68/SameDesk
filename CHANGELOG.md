@@ -19,7 +19,7 @@ new `## [x.y.z] - YYYY-MM-DD` section at the top and merge to `main`.
   init segment and keyframe.
 - **A Wi-Fi blip is a brief freeze, not a multi-second fast-forward.** The
   per-client queue held ~1.5 s of video (90 frames) with an auto-tuned kernel send
-  buffer holding megabytes more below it. The queue is now 6 frames, `SO_SNDBUF`
+  buffer holding megabytes more below it. The queue is now 10 frames, `SO_SNDBUF`
   is capped, and a slow socket write sheds the stale backlog instead of playing it
   out late. The browser does the same on its side, skipping to the next keyframe
   rather than decoding a backlog.
@@ -36,6 +36,10 @@ new `## [x.y.z] - YYYY-MM-DD` section at the top and merge to `main`.
   bandwidth).
 - **Stale decoder configs.** When the encoder's parameter sets changed mid-stream,
   clients kept the init segment they were first given.
+- **Slow first connect.** The page and script responses now close their
+  connection; Chrome would otherwise reuse the idle keep-alive connection for a
+  WebSocket handshake, which Hummingbird cannot upgrade, leaving the client in
+  its reconnect loop for a few seconds on every load.
 
 ### Changed
 - **Bitrate is decided server-side** from measured send-queue delay rather than

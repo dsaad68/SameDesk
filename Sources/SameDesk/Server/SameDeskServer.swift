@@ -38,6 +38,16 @@ final class SameDeskServer {
 
     private var serverTask: Task<Void, Error>?
 
+    // pageConnectionNote: the page and script responses close their connection
+    // instead of leaving it idle for keep-alive. Chrome will happily reuse an
+    // idle HTTP/1.1 connection for a WebSocket handshake, and Hummingbird's
+    // typed upgrader refuses to upgrade a connection that has already served
+    // plain requests (it logs "Error handling upgrade result / Inappropriate
+    // operation for state" and drops it). The browser's socket then fails and
+    // the client sits in its reconnect loop until an attempt happens to land on
+    // a fresh connection — a few seconds of "Reconnecting…" on every page load.
+    // With nothing idle to reuse, every handshake gets its own connection.
+
     /// Kernel send-buffer ceiling per connection.
     ///
     /// macOS auto-tunes SO_SNDBUF into the megabytes, which hides congestion
@@ -77,6 +87,7 @@ final class SameDeskServer {
             }
             var headers = HTTPFields()
             headers[.contentType] = "text/html; charset=utf-8"
+            headers[.connection] = "close"   // see pageConnectionNote
             return Response(status: .ok, headers: headers,
                             body: .init(byteBuffer: ByteBuffer(string: ClientAssets.html)))
         }
@@ -88,6 +99,7 @@ final class SameDeskServer {
         router.get("/client.js") { _, _ -> Response in
             var headers = HTTPFields()
             headers[.contentType] = "application/javascript; charset=utf-8"
+            headers[.connection] = "close"   // see pageConnectionNote
             return Response(status: .ok, headers: headers,
                             body: .init(byteBuffer: ByteBuffer(string: ClientAssets.js)))
         }
@@ -197,7 +209,14 @@ final class SameDeskServer {
 
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
+                var previousWasKeyframe = false
                 while let item = await client.next() {
+                    // How long this frame waited for the previous write to be
+                    // accepted by the kernel: queueing delay on the link, the
+                    // signal the bitrate controller runs on. Measured BEFORE the
+                    // write so a frame's own transmission time does not count —
+                    // a keyframe legitimately takes 100 ms+ to push over Wi-Fi.
+                    let waited = MonotonicClock.now - item.enqueuedAt
                     do {
                         switch item.frame {
                         case .binary(let data):
@@ -208,15 +227,14 @@ final class SameDeskServer {
                     } catch {
                         break // socket dead; drop this client
                     }
-                    // The write completes once the kernel has taken the bytes, so
-                    // this gap is real queueing delay on the link — the signal the
-                    // bitrate controller runs on. A long one also means everything
-                    // queued behind it is stale, so shed it and resync on an IDR
-                    // rather than play a backlog out at fast-forward.
                     guard item.isMedia else { continue }
-                    if client.recordWriteDelay(MonotonicClock.now - item.enqueuedAt) {
-                        await broadcaster.clientFellBehind(client.id)
-                    }
+                    // The frame behind a keyframe waited for the keyframe's bytes,
+                    // not for a congested link. Counting it would make every
+                    // keyframe read as congestion, cut bitrate, and ask for
+                    // another keyframe — a storm that ends in a blurry stream.
+                    let followsKeyframe = previousWasKeyframe
+                    previousWasKeyframe = item.isKeyframe
+                    if !followsKeyframe { client.recordQueueDelay(waited) }
                 }
             }
             group.addTask {

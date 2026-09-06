@@ -15,8 +15,8 @@ final class CongestionControllerTests: XCTestCase {
     func testBacksOffOnQueueingDelay() {
         var controller = makeController()
         let new = controller.update(peakWriteDelay: 0.25)
-        XCTAssertEqual(new, 4_800_000)
-        XCTAssertEqual(controller.targetBps, 4_800_000)
+        XCTAssertEqual(new, 5_600_000)
+        XCTAssertEqual(controller.targetBps, 5_600_000)
     }
 
     func testRepeatedCongestionKeepsCuttingDownToFloor() {
@@ -30,7 +30,7 @@ final class CongestionControllerTests: XCTestCase {
         _ = controller.update(peakWriteDelay: 0.25)
         let afterCut = controller.targetBps
         // Hold ticks: no increase even though the link now looks clean.
-        for _ in 0..<4 { XCTAssertNil(controller.update(peakWriteDelay: 0.001)) }
+        for _ in 0..<5 { XCTAssertNil(controller.update(peakWriteDelay: 0.001)) }
         XCTAssertEqual(controller.targetBps, afterCut)
     }
 
@@ -38,8 +38,8 @@ final class CongestionControllerTests: XCTestCase {
         var controller = makeController()
         _ = controller.update(peakWriteDelay: 0.25)
         let afterCut = controller.targetBps
-        for _ in 0..<4 { _ = controller.update(peakWriteDelay: 0.001) }   // hold
-        for _ in 0..<4 { _ = controller.update(peakWriteDelay: 0.001) }   // clean
+        for _ in 0..<5 { _ = controller.update(peakWriteDelay: 0.001) }   // hold
+        for _ in 0..<5 { _ = controller.update(peakWriteDelay: 0.001) }   // clean
         XCTAssertGreaterThan(controller.targetBps, afterCut)
     }
 
@@ -53,7 +53,7 @@ final class CongestionControllerTests: XCTestCase {
         var controller = makeController()
         _ = controller.update(peakWriteDelay: 0.25)
         let afterCut = controller.targetBps
-        for _ in 0..<20 { _ = controller.update(peakWriteDelay: 0.05) }
+        for _ in 0..<20 { _ = controller.update(peakWriteDelay: 0.04) }
         XCTAssertEqual(controller.targetBps, afterCut)
     }
 

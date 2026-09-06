@@ -18,13 +18,16 @@ enum WSFrame: Sendable {
 /// signal needs.
 struct OutboundFrame: Sendable {
     let frame: WSFrame
-    /// Monotonic time the frame entered the queue. The gap between this and the
-    /// moment the socket write completes is our congestion signal (see
-    /// `ClientConnection.recordWriteDelay`).
+    /// Monotonic time the frame entered the queue. How long it then waits for
+    /// the previous write to be accepted is our congestion signal (see
+    /// `ClientConnection.recordQueueDelay`).
     let enqueuedAt: Double
     /// Media (video/audio) may be shed under congestion; control frames
     /// (codec config, clipboard, pong) may not.
     let isMedia: Bool
+    /// An IDR fragment. Its transmission time is large and legitimate, so the
+    /// frame queued behind it must not read that wait as congestion.
+    let isKeyframe: Bool
 }
 
 /// A single connected browser's outbound path.
@@ -37,19 +40,17 @@ struct OutboundFrame: Sendable {
 final class ClientConnection: Identifiable, @unchecked Sendable {
     let id = UUID()
 
-    /// Media frames queued before we shed. Deliberately shallow: on a LAN the
-    /// queue absorbs one slow write, it is not a jitter buffer. Anything older
-    /// is stale — the viewer wants "now", not a replay. (Was 90 ≈ 1.5 s at 60 fps,
+    /// Media frames queued before we shed. Shallow: on a LAN the queue absorbs
+    /// a slow write or two, it is not a jitter buffer, and anything older is
+    /// stale — the viewer wants "now", not a replay. (Was 90 ≈ 1.5 s at 60 fps,
     /// which is what turned a 1 s Wi-Fi blip into a multi-second fast-forward.)
-    static let defaultMediaDepth = 6
+    /// It is not shallower than this because overflow costs a keyframe, and the
+    /// bitrate controller needs a tick or two to react before that happens.
+    static let defaultMediaDepth = 10
 
     /// Control frames are never dropped for being stale, but a client that has
     /// stopped reading entirely must not grow the queue without bound.
     private static let controlHardCap = 256
-
-    /// A socket write that took longer than this means the frames queued behind
-    /// it are already stale; shed them and resync instead of playing them out.
-    static let staleWriteThreshold = 0.15
 
     private let mediaDepth: Int
     private let lock = NSLock()
@@ -77,8 +78,9 @@ final class ClientConnection: Identifiable, @unchecked Sendable {
     ///   caller must then treat the client as desynchronised — a gap in the
     ///   stream is not something the decoder can recover from on its own.
     @discardableResult
-    func enqueue(_ frame: WSFrame, isMedia: Bool = true) -> Bool {
-        let item = OutboundFrame(frame: frame, enqueuedAt: MonotonicClock.now, isMedia: isMedia)
+    func enqueue(_ frame: WSFrame, isMedia: Bool = true, isKeyframe: Bool = false) -> Bool {
+        let item = OutboundFrame(frame: frame, enqueuedAt: MonotonicClock.now,
+                                 isMedia: isMedia, isKeyframe: isKeyframe)
 
         lock.lock()
         guard !finished else { lock.unlock(); return true }
@@ -139,13 +141,13 @@ final class ClientConnection: Identifiable, @unchecked Sendable {
         return dropped
     }
 
-    /// Record how long a frame sat between being queued and the kernel accepting
-    /// it. Returns true if that delay says the client is falling behind.
-    func recordWriteDelay(_ seconds: Double) -> Bool {
+    /// Record how long a frame waited in the queue before its socket write could
+    /// begin — i.e. how long the previous write took to be accepted. This is
+    /// queueing delay on the link, the bitrate controller's input.
+    func recordQueueDelay(_ seconds: Double) {
         lock.lock()
         peakWriteDelay = max(peakWriteDelay, seconds)
         lock.unlock()
-        return seconds > Self.staleWriteThreshold
     }
 
     /// Read and reset the worst write delay seen since the last call.
@@ -196,11 +198,15 @@ actor Broadcaster {
     private var inputClients: [UUID: ClientConnection] = [:]   // input/control socket
     private var latestInitSegment: Data?
     private var lastKeyframeRequest: Double = 0
+    private var keyframeRequestInterval = Broadcaster.minKeyframeRequestInterval
 
-    /// Minimum gap between keyframe requests triggered by congestion. A keyframe
-    /// is many times the size of a P-frame, so asking for one on every dropped
-    /// frame would deepen the very congestion we are recovering from.
-    private static let keyframeRequestInterval = 0.4
+    /// Gap between keyframe requests triggered by congestion. A keyframe is many
+    /// times the size of a P-frame, so asking for one on every dropped frame
+    /// deepens the very congestion we are recovering from — and if each keyframe
+    /// itself overflows the queue, that is a storm. The gap doubles while
+    /// requests keep coming and resets once things have been quiet.
+    private static let minKeyframeRequestInterval = 0.4
+    private static let maxKeyframeRequestInterval = 3.0
 
     /// Called when a client needs an IDR to (re)sync. Wired to the encoder's
     /// `requestKeyframe()`.
@@ -271,7 +277,7 @@ actor Broadcaster {
                     guard deliver(initFrame, to: client) else { needsKeyframe = true; continue }
                     client.initSent = true
                 }
-                guard deliver(fragmentFrame, to: client) else { needsKeyframe = true; continue }
+                guard deliver(fragmentFrame, to: client, isKeyframe: true) else { needsKeyframe = true; continue }
                 client.hasReceivedKeyframe = true
             } else if client.hasReceivedKeyframe {
                 if !deliver(fragmentFrame, to: client) { needsKeyframe = true }
@@ -303,14 +309,6 @@ actor Broadcaster {
         requestKeyframeThrottled()
     }
 
-    /// Reported by a client's socket task when a write took long enough that
-    /// whatever is queued behind it is stale. Shed the backlog and resync.
-    func clientFellBehind(_ id: UUID) {
-        guard let client = clients[id], client.initSent || client.hasReceivedKeyframe else { return }
-        markDesynced(client)
-        requestKeyframeThrottled()
-    }
-
     /// Worst enqueue→write delay across all clients since the last call. This is
     /// the input to the bitrate controller.
     func drainPeakWriteDelay() -> Double {
@@ -330,8 +328,8 @@ actor Broadcaster {
 
     /// Enqueue for one client, resynchronising it if the queue overflowed.
     /// - Returns: false if the client was desynchronised by this delivery.
-    private func deliver(_ frame: WSFrame, to client: ClientConnection) -> Bool {
-        guard client.enqueue(frame) else {
+    private func deliver(_ frame: WSFrame, to client: ClientConnection, isKeyframe: Bool = false) -> Bool {
+        guard client.enqueue(frame, isKeyframe: isKeyframe) else {
             markDesynced(client)
             return false
         }
@@ -348,7 +346,14 @@ actor Broadcaster {
 
     private func requestKeyframeThrottled() {
         let now = MonotonicClock.now
-        guard now - lastKeyframeRequest > Self.keyframeRequestInterval else { return }
+        let sinceLast = now - lastKeyframeRequest
+        guard sinceLast > keyframeRequestInterval else { return }
+        // Quiet for a while: back to the responsive setting. Otherwise back off.
+        if sinceLast > Self.maxKeyframeRequestInterval {
+            keyframeRequestInterval = Self.minKeyframeRequestInterval
+        } else {
+            keyframeRequestInterval = min(keyframeRequestInterval * 2, Self.maxKeyframeRequestInterval)
+        }
         lastKeyframeRequest = now
         onClientNeedsKeyframe?()
     }

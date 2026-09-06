@@ -69,11 +69,13 @@
   }
 
   // Ask the server for a fresh IDR (e.g. after a decode error / dropped frame).
-  // Throttled so a burst of errors doesn't spam keyframes.
+  // Throttled hard: a keyframe is many times the size of a P-frame, and on a
+  // struggling link asking for another one before the last has even arrived
+  // is how a hiccup turns into a storm of blurry keyframes.
   let lastKfReq = 0;
   function requestKeyframe() {
     const now = performance.now();
-    if (now - lastKfReq < 500) return;
+    if (now - lastKfReq < 1500) return;
     lastKfReq = now;
     sendInput({ type: "keyframe" });
   }
@@ -84,7 +86,12 @@
   // followed by a fast-forward) instead of showing the present. So we watch how
   // far behind we are and, when it matters, skip to the next keyframe.
   const MAX_DECODE_QUEUE = 3;     // chunks waiting on the decoder before we shed
-  const STALE_FRAME_MS = 250;     // frame age past which the backlog is worthless
+  // Frame age past which the backlog is worthless. Generous on purpose: the
+  // server already bounds staleness with a 10-frame queue and a capped kernel
+  // buffer, and the frames right behind a keyframe are legitimately late by
+  // however long the keyframe took to push. Skipping those and asking for yet
+  // another keyframe would only make the next batch later still.
+  const STALE_FRAME_MS = 600;
 
   const WebCodecsSink = (() => {
     let decoder = null, configured = false, ts = 0, waitingKey = true, codecKind = "avc";
@@ -595,16 +602,41 @@
   // arrive. Both are registered and the raw one wins when it is live, so an
   // engine that never fires it (Safari) still moves the mouse.
   let lastRawUpdate = 0;
+  // Raw updates arrive at the mouse's report rate — up to 1000 Hz — and each one
+  // was a JSON message here and a CGEvent on the Mac. Coalesce to ~250 Hz: well
+  // above any display rate, so it costs no perceptible latency, and it keeps
+  // the Mac's window server from being flooded with pointer events (which is
+  // the same process that captures the screen for us).
+  const MOVE_INTERVAL_MS = 4;
+  let pendingMove = null, moveTimer = null, lastMoveSent = 0;
+  function flushMove() {
+    moveTimer = null;
+    if (!pendingMove) return;
+    lastMoveSent = performance.now();
+    sendInput(pendingMove);
+    pendingMove = null;
+  }
+  function queueMove(msg) {
+    if (msg.rel && pendingMove && pendingMove.rel) {
+      // Relative deltas must accumulate; absolute positions just replace.
+      msg.dx += pendingMove.dx; msg.dy += pendingMove.dy;
+    }
+    pendingMove = msg;
+    const since = performance.now() - lastMoveSent;
+    if (since >= MOVE_INTERVAL_MS) flushMove();
+    else if (!moveTimer) moveTimer = setTimeout(flushMove, MOVE_INTERVAL_MS - since);
+  }
   function onPointerMove(e) {
     if (e.type === "pointerrawupdate") lastRawUpdate = performance.now();
     else if (performance.now() - lastRawUpdate < 500) return;
     Cursor.onLocalMove(e);
     if (locked()) {
       const d = displayedRect();
-      sendInput({ type: "mousemove", rel: true, dx: e.movementX / d.w, dy: e.movementY / d.h,
-             button: e.buttons ? 0 : undefined });
+      queueMove({ type: "mousemove", rel: true, dx: e.movementX / d.w, dy: e.movementY / d.h,
+                  button: e.buttons ? 0 : undefined });
     } else {
-      const p = norm(e); sendInput({ type: "mousemove", x: p.x, y: p.y, button: e.buttons ? 0 : undefined });
+      const p = norm(e);
+      queueMove({ type: "mousemove", x: p.x, y: p.y, button: e.buttons ? 0 : undefined });
     }
   }
   stage.addEventListener("pointerrawupdate", onPointerMove);

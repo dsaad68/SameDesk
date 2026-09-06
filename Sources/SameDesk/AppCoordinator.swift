@@ -547,13 +547,14 @@ final class AppCoordinator {
     }
 
     /// Sample the send-queue delay on a fixed tick and let the bitrate policy
-    /// react. 250 ms is fast enough to catch a Wi-Fi blip within a few frames
-    /// and slow enough that we are not reconfiguring the encoder constantly.
+    /// react. 200 ms is fast enough to cut bitrate before a 10-frame queue
+    /// overflows under a bandwidth crunch (overflow costs a keyframe), and slow
+    /// enough that we are not reconfiguring the encoder constantly.
     private func startCongestionController() {
         let broadcaster = self.broadcaster
         congestionTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                try? await Task.sleep(nanoseconds: 200_000_000)
                 if Task.isCancelled { return }
                 let peak = await broadcaster.drainPeakWriteDelay()
                 self?.applyCongestionSample(peak)
