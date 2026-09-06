@@ -53,7 +53,12 @@ final class FMP4Muxer {
         if let hvcC = atoms["hvcC"] as? Data {
             newCodec = .hevc; record = hvcC
         } else if let avcC = atoms["avcC"] as? Data {
-            newCodec = .h264; record = avcC
+            newCodec = .h264
+            // VideoToolbox omits the VUI bitstream restriction, which leaves a
+            // browser decoder free to hold frames back for a reorder window we
+            // never use. Rewrite it to say so; keep the original if anything
+            // about the record is unexpected.
+            record = H264ParameterSets.rewritingForLowLatencyDecode(avcC) ?? avcC
         } else {
             return false
         }
