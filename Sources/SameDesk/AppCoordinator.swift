@@ -274,8 +274,8 @@ final class AppCoordinator {
         // The user's value is the ceiling; the controller may still hold below it
         // while the link is congested.
         if congestion != nil {
-            let applied = congestion?.setCeiling(bps)
-            encoder?.setBitrate(applied ?? congestion?.targetBps ?? bps)
+            _ = congestion?.setCeiling(bps)
+            encoder?.setBitrate(congestion?.targetBps ?? bps)
         } else {
             encoder?.setBitrate(bps)
         }
