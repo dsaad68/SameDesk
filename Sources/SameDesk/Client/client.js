@@ -603,11 +603,15 @@
   // engine that never fires it (Safari) still moves the mouse.
   let lastRawUpdate = 0;
   // Raw updates arrive at the mouse's report rate — up to 1000 Hz — and each one
-  // was a JSON message here and a CGEvent on the Mac. Coalesce to ~250 Hz: well
-  // above any display rate, so it costs no perceptible latency, and it keeps
-  // the Mac's window server from being flooded with pointer events (which is
-  // the same process that captures the screen for us).
-  const MOVE_INTERVAL_MS = 4;
+  // was a WebSocket message (its own TLS record and TCP segment) and a CGEvent on
+  // the Mac. Under pointer lock the mouse never stops generating them. Wi-Fi is
+  // half-duplex: a thousand tiny upstream packets a second steal airtime from
+  // the video coming the other way, and the bitrate controller then sees the
+  // video queue back up and cuts. Coalesce to 125 Hz — a USB mouse's native
+  // rate, and what Moonlight batches relative motion to. Relative to Chrome's
+  // old render-aligned mousemove this still trims ~4 ms of input latency on
+  // average, without the flood.
+  const MOVE_INTERVAL_MS = 8;
   let pendingMove = null, moveTimer = null, lastMoveSent = 0;
   function flushMove() {
     moveTimer = null;
