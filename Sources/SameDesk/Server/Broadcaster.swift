@@ -191,7 +191,8 @@ final class ClientConnection: Identifiable, @unchecked Sendable {
 /// slowness. When a client's queue overflows or its socket stalls, the client is
 /// resynchronised on a fresh keyframe via `onClientNeedsKeyframe`.
 actor Broadcaster {
-    private var clients: [UUID: ClientConnection] = [:]        // media (video/audio)
+    private var clients: [UUID: ClientConnection] = [:]        // video
+    private var audioClients: [UUID: ClientConnection] = [:]   // audio
     private var inputClients: [UUID: ClientConnection] = [:]   // input/control socket
     private var latestInitSegment: Data?
     private var lastKeyframeRequest: Double = 0
@@ -220,6 +221,15 @@ actor Broadcaster {
     func remove(_ id: UUID) {
         clients[id]?.finish()
         clients[id] = nil
+    }
+
+    func addAudio(_ client: ClientConnection) {
+        audioClients[client.id] = client
+    }
+
+    func removeAudio(_ id: UUID) {
+        audioClients[id]?.finish()
+        audioClients[id] = nil
     }
 
     func addInput(_ client: ClientConnection) {
@@ -270,16 +280,27 @@ actor Broadcaster {
         if needsKeyframe { requestKeyframeThrottled() }
     }
 
-    /// Broadcast an audio payload to all clients. Audio is independent of the
-    /// video keyframe state, so it goes to every connected client.
+    /// Broadcast an audio payload on the audio socket.
+    ///
+    /// Audio rides its own connection: sharing the video socket meant a 400 KB
+    /// keyframe delayed every sample behind it, and a congested video queue shed
+    /// audio buffers as readily as frames. A dropped audio buffer is a click —
+    /// bad, but self-healing, and emphatically not a reason to spend a keyframe.
     func broadcastAudio(_ payload: Data) {
-        guard !clients.isEmpty else { return }
-        let frame = WSFrame.binary(Self.tagged(1, payload))
-        var needsKeyframe = false
-        for client in clients.values where !deliver(frame, to: client) {
-            needsKeyframe = true
+        guard !audioClients.isEmpty else { return }
+        let frame = WSFrame.binary(payload)
+        for client in audioClients.values { client.enqueue(frame) }
+    }
+
+    /// The encoder's parameter sets changed (resolution or codec), so the init
+    /// segment every client is holding is stale. Make them all take the new one
+    /// on the next keyframe.
+    func parameterSetsChanged() {
+        for client in clients.values {
+            client.initSent = false
+            client.hasReceivedKeyframe = false
         }
-        if needsKeyframe { requestKeyframeThrottled() }
+        requestKeyframeThrottled()
     }
 
     /// Reported by a client's socket task when a write took long enough that
@@ -328,16 +349,9 @@ actor Broadcaster {
         onClientNeedsKeyframe?()
     }
 
-    /// Prepend a 1-byte stream tag (0 = video, 1 = audio) so the client can
-    /// route binary messages.
-    private static func tagged(_ tag: UInt8, _ data: Data) -> Data {
-        var d = Data(capacity: data.count + 1)
-        d.append(tag)
-        d.append(data)
-        return d
-    }
-
     /// Video frame header: [tag=0][captureTimeMs: Float64 big-endian] + payload.
+    /// The tag is vestigial now that audio has its own socket, but it keeps the
+    /// framing stable for clients that have not reloaded.
     /// The client uses captureTimeMs (plus a clock offset) both for the
     /// glass-to-glass readout and to decide when it has fallen behind live.
     private static func taggedVideo(_ data: Data, captureTimeMs: Double) -> Data {

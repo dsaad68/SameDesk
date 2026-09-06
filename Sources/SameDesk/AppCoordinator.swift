@@ -479,8 +479,13 @@ final class AppCoordinator {
         frameConsumer = Task.detached {
             for await frame in stream {
                 if frame.isKeyframe, let fmt = frame.formatDescription {
-                    muxer.updateParameterSets(from: fmt)
-                    codecHolder.withLock { $0 = muxer.codecString }
+                    if muxer.updateParameterSets(from: fmt) {
+                        codecHolder.withLock { $0 = muxer.codecString }
+                        // Resolution or codec changed: every connected client is
+                        // holding an init segment that no longer describes the
+                        // stream, and nothing was resending it to them.
+                        await broadcaster.parameterSetsChanged()
+                    }
                 }
                 guard muxer.isReady else { continue }
                 let fragment = muxer.buildFragment(avccData: frame.avccData,

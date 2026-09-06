@@ -6,6 +6,7 @@
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const wsURL = `${scheme}://${location.host}/ws`;
   const inputURL = `${scheme}://${location.host}/input`;
+  const audioURL = `${scheme}://${location.host}/audio`;
 
   // The codec is delivered at runtime by the server as the first text frame on
   // the media socket (a {type:"config",codec} message, always sent before any
@@ -359,19 +360,25 @@
       return ctx;
     }
     function unlock() { ensureCtx(); }
+    // [format:1][channels:1][reserved:2][sampleRate:4 BE][interleaved PCM…]
+    // format 1 = Int16 (what the server sends), 0 = Float32.
     function push(arrayBuffer) {
       const c = ensureCtx();
       if (!c || c.state !== "running") return;   // not unlocked yet
+      if (arrayBuffer.byteLength <= 8) return;
       const dv = new DataView(arrayBuffer);
+      const format = dv.getUint8(0);
       const ch = dv.getUint8(1) || 2;
       const sr = dv.getUint32(4, false) || 48000;
-      const pcm = new Float32Array(arrayBuffer.slice(8));   // interleaved
+      const body = arrayBuffer.slice(8);
+      const pcm = format === 1 ? new Int16Array(body) : new Float32Array(body);
+      const scale = format === 1 ? 1 / 32767 : 1;
       const frames = Math.floor(pcm.length / ch);
       if (frames === 0) return;
       const buf = c.createBuffer(ch, frames, sr);
       for (let chan = 0; chan < ch; chan++) {
         const out = buf.getChannelData(chan);
-        for (let f = 0; f < frames; f++) out[f] = pcm[f * ch + chan];
+        for (let f = 0; f < frames; f++) out[f] = pcm[f * ch + chan] * scale;
       }
       const node = c.createBufferSource();
       node.buffer = buf;
@@ -391,7 +398,7 @@
   // Video/audio ride /ws; input/clipboard/ping/control ride /input. Splitting
   // them means input never queues behind video frames (TCP is one ordered
   // stream), so clicks/keys stay responsive even when video saturates the link.
-  let mediaWS, inputWS, mediaTimer = null, inputTimer = null;
+  let mediaWS, inputWS, audioWS, mediaTimer = null, inputTimer = null, audioTimer = null;
 
   // The server's first frame on the media socket is a JSON {type:"config",codec}
   // that names the video codec; it always precedes any binary segment. We set
@@ -417,7 +424,7 @@
     mediaWS.onmessage = (ev) => {
       if (typeof ev.data === "string") { handleMediaText(ev.data); return; }
       const u8 = new Uint8Array(ev.data);
-      if (u8[0] === 1) { AudioOut.push(ev.data); return; }
+      if (u8[0] !== 0) return;                     // video only on this socket
       if (!CODEC_ID) return;                       // wait for the config frame
       // Video frame: [tag=0][captureTimeMs: Float64 BE][fMP4]. captureTimeMs is
       // stamped at CAPTURE (from the ScreenCaptureKit PTS), so the age below is
@@ -439,6 +446,16 @@
     inputWS = new WebSocket(inputURL);
     inputWS.onclose = () => { inputTimer = setTimeout(connectInput, 1500); };
     inputWS.onmessage = (ev) => { if (typeof ev.data === "string") handleControl(JSON.parse(ev.data)); };
+  }
+
+  // Audio has its own socket so a keyframe never delays a sample, and a
+  // congested video queue never sheds audio buffers as clicks.
+  function connectAudio() {
+    clearTimeout(audioTimer);
+    audioWS = new WebSocket(audioURL);
+    audioWS.binaryType = "arraybuffer";
+    audioWS.onclose = () => { audioTimer = setTimeout(connectAudio, 1500); };
+    audioWS.onmessage = (ev) => { if (typeof ev.data !== "string") AudioOut.push(ev.data); };
   }
 
   function sendInput(obj) {
@@ -675,6 +692,7 @@
     updateQualityHUD();
     connectMedia();
     connectInput();
+    connectAudio();
     displayEl.focus();
     // Watchdog: if the media socket never opens, say so instead of sitting silent.
     setTimeout(() => {

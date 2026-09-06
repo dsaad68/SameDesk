@@ -27,9 +27,10 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// cheaper — a bare mouse move stops dirtying the frame at all.
     var showsCursor: Bool = true
 
-    /// Delivered for each audio buffer: a ready-to-send payload of
-    /// `[channels:1][reserved:2][sampleRate:4 BE][Float32 LE interleaved PCM…]`.
-    /// (The broadcaster prepends a 1-byte type tag.)
+    /// Delivered for each audio buffer, ready to send on the audio socket:
+    /// `[format:1][channels:1][reserved:2][sampleRate:4 BE][interleaved PCM…]`.
+    /// The 8-byte header keeps the samples 2- and 4-byte aligned for the client.
+    /// Format 1 is Int16; 0 (Float32) is reserved for a client that asks for it.
     var onAudio: ((Data) -> Void)?
 
     /// Optional downscale (pixel count dominates encode cost).
@@ -257,23 +258,30 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
             blockBufferOut: &blockBuffer)
         guard status == noErr else { return }
 
-        // Build interleaved Float32 [frame0 ch0, frame0 ch1, frame1 ch0, …].
-        var interleaved = [Float32](repeating: 0, count: frames * channels)
+        // Build interleaved Int16 [frame0 ch0, frame0 ch1, frame1 ch0, …].
+        // Float32 PCM was 3.1 Mbps of uncompressed audio sharing the link with
+        // video; 16-bit is half that and indistinguishable for desktop audio.
+        // (Opus would be ~25x smaller again — worth doing, but it needs codec
+        // negotiation with the client, so it is deliberately not folded in here.)
+        var interleaved = [Int16](repeating: 0, count: frames * channels)
+        func clamp(_ sample: Float32) -> Int16 {
+            Int16(max(-32_768, min(32_767, (sample * 32_767).rounded())))
+        }
         if nonInterleaved {
             for ch in 0..<min(channels, abl.count) {
                 guard let data = abl[ch].mData else { continue }
                 let src = data.bindMemory(to: Float32.self, capacity: frames)
-                for f in 0..<frames { interleaved[f * channels + ch] = src[f] }
+                for f in 0..<frames { interleaved[f * channels + ch] = clamp(src[f]) }
             }
         } else if let data = abl[0].mData {
             let src = data.bindMemory(to: Float32.self, capacity: frames * channels)
-            for i in 0..<(frames * channels) { interleaved[i] = src[i] }
+            for i in 0..<(frames * channels) { interleaved[i] = clamp(src[i]) }
         }
 
-        // Header: channels(1) + reserved(2) + sampleRate(4 BE), then PCM. The
-        // total header (incl. the broadcaster's 1-byte tag) is 8 bytes, keeping
-        // the Float32 payload 4-byte aligned for the client.
-        var payload = Data(capacity: 7 + interleaved.count * 4)
+        // Header: format(1) + channels(1) + reserved(2) + sampleRate(4 BE), then
+        // PCM. 8 bytes keeps the samples aligned for a typed-array view.
+        var payload = Data(capacity: 8 + interleaved.count * 2)
+        payload.append(1)                       // format: Int16
         payload.append(UInt8(channels))
         payload.append(contentsOf: [0, 0])
         payload.append(UInt8((sampleRate >> 24) & 0xFF))

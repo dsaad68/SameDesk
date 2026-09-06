@@ -105,6 +105,21 @@ final class SameDeskServer {
             }
         )
 
+        // GET /audio — audio only, on its own socket. Sharing the video socket
+        // meant every sample queued behind whatever keyframe happened to be in
+        // flight, and a congested video queue shed audio buffers as clicks.
+        router.ws(
+            "/audio",
+            shouldUpgrade: { request, _ in
+                guard tokenStore.isValid(Self.authToken(from: request)) else { return .dontUpgrade }
+                return .upgrade(HTTPFields())
+            },
+            onUpgrade: { [weak self] inbound, outbound, _ in
+                guard let self else { return }
+                await self.handleAudioConnection(inbound: inbound, outbound: outbound)
+            }
+        )
+
         // GET /input — a SEPARATE token-gated WebSocket carrying only input,
         // clipboard, ping/pong and control. Keeping it off the video socket
         // means clicks/keys never queue behind video frames (TCP is one ordered
@@ -199,6 +214,37 @@ final class SameDeskServer {
                     guard item.isMedia else { continue }
                     if client.recordWriteDelay(MonotonicClock.now - item.enqueuedAt) {
                         await broadcaster.clientFellBehind(client.id)
+                    }
+                }
+            }
+            group.addTask {
+                do { for try await _ in inbound.messages(maxSize: 1 << 20) {} } catch {}
+            }
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
+    /// Audio connection: write-only, and deliberately independent of the video
+    /// stream's keyframe state and congestion handling.
+    private func handleAudioConnection(
+        inbound: WebSocketInboundStream,
+        outbound: WebSocketOutboundWriter
+    ) async {
+        let client = ClientConnection()
+        let broadcaster = self.broadcaster
+        await broadcaster.addAudio(client)
+        defer { Task { await broadcaster.removeAudio(client.id) } }
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                while let item = await client.next() {
+                    do {
+                        if case .binary(let data) = item.frame {
+                            try await outbound.write(.binary(ByteBuffer(data: data)))
+                        }
+                    } catch {
+                        break
                     }
                 }
             }
