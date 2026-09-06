@@ -1,6 +1,7 @@
 import AudioToolbox
 import CoreMedia
 import CoreVideo
+import Dispatch
 import Foundation
 import ScreenCaptureKit
 
@@ -33,6 +34,20 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// new client connects while the screen is idle (delta encoding would
     /// otherwise skip every frame, leaving the new client with no video).
     private var lastPixelBuffer: CVPixelBuffer?
+
+    /// Static-screen refinement. Delta encoding skips unchanged frames, which
+    /// leaves the LAST frame of a burst of motion — encoded under motion, at
+    /// motion quality — frozen on screen. Re-submitting the cached frame a
+    /// couple of times once things settle lets the encoder spend a full frame
+    /// budget on a near-zero residual, and the text sharpens back up. The frames
+    /// cost almost nothing precisely because nothing changed.
+    private static let refinementFrames = 2
+    private static let settleDelay = 0.08      // motion must have stopped this long
+    private static let refinementSpacing = 0.06 // give rate control a fresh budget
+    private var refinementsRemaining = 0
+    private var lastChangeTime: Double = 0
+    private var lastRefinementTime: Double = 0
+    private var refinementTimer: DispatchSourceTimer?
 
     init(encoder: H264Encoder) {
         self.encoder = encoder
@@ -69,11 +84,17 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let config = SCStreamConfiguration()
         config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        // Shallow queue: we drop frames when the encoder is busy rather than let
-        // them back up, so a small depth keeps us at the live edge (a deep queue
-        // just adds motion-to-photon latency). 3 is ScreenCaptureKit's minimum.
-        config.queueDepth = 3
+        // 4:2:0 is what the hardware encoder consumes. Capturing BGRA made
+        // VideoToolbox convert every single frame before it could start work;
+        // asking ScreenCaptureKit for 420v hands the encoder what it wants.
+        // (Apple's own guidance: BGRA for on-screen display, 420v for encoding.)
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        // We drop frames when the encoder is full rather than let them back up,
+        // so depth is not latency here — it is headroom. It has to cover the
+        // frames the encoder holds in flight plus the one we cache for
+        // keyframe-on-connect, or ScreenCaptureKit starves waiting for surfaces.
+        config.queueDepth = 5
         config.showsCursor = true
 
         if let downscale {
@@ -105,12 +126,39 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         try await stream.startCapture()
         self.stream = stream
+        startRefinementTimer()
     }
 
     func stop() async {
+        refinementTimer?.cancel()
+        refinementTimer = nil
         guard let stream else { return }
         try? await stream.stopCapture()
         self.stream = nil
+    }
+
+    /// Drives static-screen refinement. A timer rather than the capture callback,
+    /// because an idle screen delivers frames at only a frame or two per second —
+    /// far too slow to sharpen the picture while the user is still looking at it.
+    private func startRefinementTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
+        timer.schedule(deadline: .now() + 0.1, repeating: 0.05)
+        timer.setEventHandler { [weak self] in self?.refineIfSettled() }
+        refinementTimer = timer
+        timer.resume()
+    }
+
+    /// Runs on `sampleQueue`, so it shares the capture callback's state without
+    /// locking.
+    private func refineIfSettled() {
+        guard deltaEncodingEnabled, refinementsRemaining > 0,
+              let buffer = lastPixelBuffer, !encoder.isEncoding else { return }
+        let now = MonotonicClock.now
+        guard now - lastChangeTime > Self.settleDelay,
+              now - lastRefinementTime > Self.refinementSpacing else { return }
+        lastRefinementTime = now
+        refinementsRemaining -= 1
+        encoder.encode(pixelBuffer: buffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
     }
 
     /// Scale dimensions down so the long edge is at most `maxEdge`, preserving
@@ -157,6 +205,9 @@ final class ScreenCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
             // gate every frame (near-zero video even when the screen changes).
             let dirtyRects = attachments[.dirtyRects] as? [Any] ?? []
             if dirtyRects.isEmpty { return }
+            // Something changed: arm the refinement pass for when it stops.
+            lastChangeTime = MonotonicClock.now
+            refinementsRemaining = Self.refinementFrames
         }
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }

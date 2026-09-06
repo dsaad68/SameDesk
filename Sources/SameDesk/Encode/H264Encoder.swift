@@ -62,9 +62,19 @@ final class H264Encoder {
     private let requestedCodec: VideoCodec
     private(set) var effectiveCodec: VideoCodec
 
-    /// True while a frame is being encoded. Guarded by an unfair lock so the
-    /// capture thread can test-and-skip cheaply.
-    private let inFlight = OSAllocatedUnfairLock(initialState: false)
+    /// Frames handed to the encoder but not yet returned. Guarded by an unfair
+    /// lock so the capture thread can test-and-skip cheaply.
+    ///
+    /// The hardware encoder pipelines, so admitting a second frame keeps 60fps
+    /// when one encode overruns a frame interval — which it does at 1440p+ on a
+    /// busy screen. Serialising it turned that into a hard 30fps cliff. Two is
+    /// the whole budget: more would just queue latency ahead of the network.
+    private static let maxFramesInFlight = 2
+    private let inFlight = OSAllocatedUnfairLock(initialState: 0)
+
+    /// True once low-latency rate control is confirmed active (informational;
+    /// surfaced in diagnostics).
+    private(set) var usesLowLatencyRateControl = false
 
     /// Set when a new client connects: the next submitted frame is forced to be
     /// an IDR so new clients sync immediately without periodic-IDR bitrate spikes.
@@ -80,8 +90,10 @@ final class H264Encoder {
 
     deinit { invalidate() }
 
+    /// True when the encoder has no room for another frame; the capturer drops
+    /// rather than queue.
     var isEncoding: Bool {
-        inFlight.withLock { $0 }
+        inFlight.withLock { $0 >= Self.maxFramesInFlight }
     }
 
     /// Request that the next encoded frame be a keyframe (IDR).
@@ -104,6 +116,17 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: limits)
     }
 
+    /// Cap the per-frame quantiser: a floor under image quality so text does not
+    /// dissolve during motion. Costs bitrate overshoot when the scene is busy,
+    /// which is the right trade on a LAN — but not on a link that is already
+    /// struggling, so the caller relaxes it when bitrate has been cut hard.
+    /// Only meaningful in low-latency rate control mode; ignored otherwise.
+    func setMaxFrameQP(_ qp: Int) {
+        guard let session, usesLowLatencyRateControl else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                             value: NSNumber(value: qp))
+    }
+
     // MARK: - Session lifecycle
 
     private func ensureSession(width: Int32, height: Int32) -> VTCompressionSession? {
@@ -112,14 +135,22 @@ final class H264Encoder {
         }
         invalidate()
 
-        func create(_ codec: VideoCodec) -> (OSStatus, VTCompressionSession?) {
+        func create(_ codec: VideoCodec, lowLatency: Bool) -> (OSStatus, VTCompressionSession?) {
             var s: VTCompressionSession?
+            // Low-latency rate control (macOS 11.3+) picks a hardware encoder and
+            // switches to a rate controller that adapts within a few frames
+            // instead of over a second. It also unlocks MaxAllowedFrameQP. Apple
+            // documents it for H.264; HEVC accepts it on recent hardware, so we
+            // ask and fall back rather than assume.
+            let spec: CFDictionary? = lowLatency
+                ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
+                : nil
             let st = VTCompressionSessionCreate(
                 allocator: kCFAllocatorDefault,
                 width: width,
                 height: height,
                 codecType: codec.cmCodecType,
-                encoderSpecification: nil,
+                encoderSpecification: spec,
                 imageBufferAttributes: nil,
                 compressedDataAllocator: nil,
                 outputCallback: nil,     // using the block-based EncodeFrame variant
@@ -129,19 +160,33 @@ final class H264Encoder {
             return (st, s)
         }
 
-        var (status, newSession) = create(requestedCodec)
-        if status != noErr || newSession == nil, requestedCodec == .hevc {
-            // Hardware can't encode HEVC here — fall back to H.264.
-            NSLog("SameDesk: HEVC encode unavailable (\(status)); falling back to H.264.")
-            effectiveCodec = .h264
-            (status, newSession) = create(.h264)
-        } else {
-            effectiveCodec = requestedCodec
+        // Try, in order: requested codec with low latency, requested codec
+        // without, then the same pair for H.264 if HEVC was asked for.
+        var candidates: [(VideoCodec, Bool)] = [(requestedCodec, true), (requestedCodec, false)]
+        if requestedCodec == .hevc { candidates += [(.h264, true), (.h264, false)] }
+
+        var status: OSStatus = noErr
+        var newSession: VTCompressionSession?
+        var chosen = (codec: requestedCodec, lowLatency: true)
+        for candidate in candidates {
+            (status, newSession) = create(candidate.0, lowLatency: candidate.1)
+            if status == noErr, newSession != nil {
+                chosen = (candidate.0, candidate.1)
+                break
+            }
         }
         guard status == noErr, let session = newSession else {
             NSLog("SameDesk: VTCompressionSessionCreate failed: \(status)")
             return nil
         }
+        if chosen.codec != requestedCodec {
+            NSLog("SameDesk: HEVC encode unavailable; falling back to H.264.")
+        }
+        if !chosen.lowLatency {
+            NSLog("SameDesk: low-latency rate control unavailable; using the default rate controller.")
+        }
+        effectiveCodec = chosen.codec
+        usesLowLatencyRateControl = chosen.lowLatency
 
         configure(session)
         self.session = session
@@ -178,9 +223,20 @@ final class H264Encoder {
             set(kVTCompressionPropertyKey_H264EntropyMode, kVTH264EntropyMode_CABAC)
         }
         set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 60))
+        // Quality floor for text. See setMaxFrameQP.
+        if usesLowLatencyRateControl {
+            set(kVTCompressionPropertyKey_MaxAllowedFrameQP, NSNumber(value: Self.defaultMaxFrameQP))
+        }
 
         VTCompressionSessionPrepareToEncodeFrames(session)
     }
+
+    /// Per-frame quantiser cap while the link is healthy. Above roughly this,
+    /// small text stops being legible.
+    static let defaultMaxFrameQP = 36
+    /// Relaxed cap once bitrate has been cut hard: at that point a smooth
+    /// picture matters more than a sharp one.
+    static let relaxedMaxFrameQP = 45
 
     func invalidate() {
         if let session {
@@ -196,18 +252,18 @@ final class H264Encoder {
     /// Submit a frame. Returns immediately. Drops the frame if the encoder is
     /// still busy with the previous one (never backlogs).
     func encode(pixelBuffer: CVPixelBuffer, pts: CMTime) {
-        // Drop if busy.
-        let shouldEncode = inFlight.withLock { busy -> Bool in
-            if busy { return false }
-            busy = true
+        // Drop if the encoder already has its fill; never backlog.
+        let admitted = inFlight.withLock { count -> Bool in
+            guard count < Self.maxFramesInFlight else { return false }
+            count += 1
             return true
         }
-        guard shouldEncode else { return }
+        guard admitted else { return }
 
         let w = Int32(CVPixelBufferGetWidth(pixelBuffer))
         let h = Int32(CVPixelBufferGetHeight(pixelBuffer))
         guard let session = ensureSession(width: w, height: h) else {
-            inFlight.withLock { $0 = false }
+            inFlight.withLock { $0 -= 1 }
             return
         }
 
@@ -228,13 +284,13 @@ final class H264Encoder {
             infoFlagsOut: nil
         ) { [weak self] status, _, sampleBuffer in
             guard let self else { return }
-            defer { self.inFlight.withLock { $0 = false } }
+            defer { self.inFlight.withLock { $0 -= 1 } }
             guard status == noErr, let sampleBuffer else { return }
             self.handleEncoded(sampleBuffer)
         }
 
         if status != noErr {
-            inFlight.withLock { $0 = false }
+            inFlight.withLock { $0 -= 1 }
         }
     }
 

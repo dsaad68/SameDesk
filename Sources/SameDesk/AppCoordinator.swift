@@ -393,7 +393,7 @@ final class AppCoordinator {
         URL:       \(baseURL)
         Clients:   \(clients) connected
 
-        Codec:     \(Settings.shared.useHEVC ? "HEVC" : "H.264") (\(codec))
+        Codec:     \(Settings.shared.useHEVC ? "HEVC" : "H.264") (\(codec))\(encoder?.usesLowLatencyRateControl == true ? " low-latency RC" : "")
         Bitrate:   \(String(format: "%.1f", currentBitrateMbps)) Mbps of \(String(format: "%.0f", bitrateMbps)) Mbps ceiling
         Queue:     \(String(format: "%.0f", lastQueueDelay * 1000)) ms send delay
         Delta:     \(Settings.shared.deltaEncoding ? "on" : "off")
@@ -513,6 +513,11 @@ final class AppCoordinator {
         congestion = controller
         guard let newBitrate else { return }
         encoder?.setBitrate(newBitrate)
+        // Insisting on sharp text costs bitrate overshoot, which is the wrong
+        // trade once the link is already the bottleneck: relax the quality floor
+        // when we have had to cut hard.
+        let strained = newBitrate * 2 < Settings.shared.bitrateBps
+        encoder?.setMaxFrameQP(strained ? H264Encoder.relaxedMaxFrameQP : H264Encoder.defaultMaxFrameQP)
         // Tell the client what it is actually getting, so the HUD reports the
         // real target instead of a number it made up itself.
         let message = OutboundMessage.quality(mbps: Double(newBitrate) / 1_000_000).jsonString()
